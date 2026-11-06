@@ -19,9 +19,10 @@ import json
 import queue
 import threading
 import subprocess
+import tempfile
 from pathlib import Path
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import messagebox
 
 try:
     import assistant as backend
@@ -37,18 +38,20 @@ try:
 except Exception as exc:
     raise SystemExit(f"Missing Ollama Python package. Install it in your venv: pip install ollama\n{exc}")
 
-APP_TITLE = "Nova AI"
-MODEL = getattr(backend, "MODEL", "gemma3:4b")
-BG = "#10141c"
-PANEL = "#171d28"
-PANEL_2 = "#202838"
-TEXT = "#edf2f7"
-MUTED = "#9aa8ba"
-ACCENT = "#75a7ff"
-USER_BUBBLE = "#243b5a"
-BOT_BUBBLE = "#1c2634"
-BORDER = "#303b4d"
+try:
+    import customtkinter as ctk
+except Exception as exc:
+    raise SystemExit(f"Missing CustomTkinter. Install it in your venv: pip install customtkinter\n{exc}")
 
+from nova_widgets import (
+    ACCENT, ACCENT_HOVER, ACCENT_SOFT, BG, BORDER, DANGER, DANGER_SOFT, MUTED,
+    SIDEBAR, SUBTLE, SUCCESS, SURFACE, SURFACE_2, TEXT, WARNING,
+    ChatView, Fonts, Icon, NavButton, SessionList, StatusPill, Tooltip,
+    autohide_scrollbar, bind_tree, fit_text, icon_button, set_cursor,
+)
+
+APP_TITLE = "Nova"
+MODEL = getattr(backend, "MODEL", "gemma3:4b")
 
 
 SETTINGS_PATH = Path(__file__).resolve().with_name("nova_settings.json")
@@ -911,7 +914,32 @@ def detect_wake_phrase(status_callback, stop_event, resume_event, event_queue, i
     status_callback("Wake-word listener stopped")
 
 
+
+def nova_icon_image(size=64):
+    """Nova's app/tray icon as a PIL image, or None if Pillow isn't installed."""
+    try:
+        from PIL import Image, ImageDraw
+    except Exception:
+        return None
+    scale = size / 64
+    image = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(image)
+    draw.rounded_rectangle((2 * scale, 2 * scale, 62 * scale, 62 * scale), radius=16 * scale, fill=(124, 140, 255, 255))
+    # Four-point sparkle
+    c, r, w = 32 * scale, 20 * scale, 5 * scale
+    draw.polygon([(c, c - r), (c + w, c - w), (c + r, c), (c + w, c + w),
+                  (c, c + r), (c - w, c + w), (c - r, c), (c - w, c - w)], fill=(255, 255, 255, 255))
+    return image
+
+
 class NovaGUI:
+    SUGGESTIONS = (
+        "Remind me to stretch in 30 minutes",
+        "Open YouTube",
+        "Find file invoice in downloads",
+        "Explain how a CPU works",
+    )
+
     def __init__(self, root):
         self.root = root
         self.settings = load_nova_settings()
@@ -919,10 +947,16 @@ class NovaGUI:
         self.tray_icon = None
         self.tray_thread = None
         self._exiting = False
+        self.fonts = Fonts(root)
         self.root.title(APP_TITLE)
-        self.root.geometry("1120x760")
-        self.root.minsize(850, 600)
-        self.root.configure(bg=BG)
+        self.root.geometry("1180x780")
+        self.root.minsize(900, 600)
+        if isinstance(self.root, ctk.CTk):
+            self.root.configure(fg_color=BG)
+        else:
+            self.root.configure(bg=BG)
+        self._icon_path = self._make_icon_file()
+        self._apply_icon(self.root)
         self.events = queue.Queue()
         self.busy = False
         self.voice_response = False
@@ -933,191 +967,315 @@ class NovaGUI:
         self.session_id = current_session_id()
         self.sessions = []
         self.chat_cache = []
-        self._configure_styles()
         self._build_ui()
         self.refresh_sessions(select_current=True)
         self.load_chat()
         self.refresh_memories()
         initialize_productivity_tables()
-        self.set_status("Ready • Local mode")
+        self.set_status("Ready")
         self.root.after(100, self.poll_events)
         self.root.after(1000, self.poll_due_reminders)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         if self.tray_dependencies:
             self.start_tray_icon()
+        self.root.after(200, self.input_text.focus_set)
 
-    def _configure_styles(self):
-        style = ttk.Style()
+    # -------------------- window icon --------------------
+    def _make_icon_file(self):
+        image = nova_icon_image(64)
+        if image is None:
+            return None
         try:
-            style.theme_use("clam")
+            path = Path(tempfile.gettempdir()) / "nova_icon.ico"
+            image.save(path, sizes=[(16, 16), (24, 24), (32, 32), (48, 48), (64, 64)])
+            return path
         except Exception:
-            pass
-        style.configure("TFrame", background=BG)
-        style.configure("Panel.TFrame", background=PANEL)
-        style.configure("TLabel", background=BG, foreground=TEXT, font=("Segoe UI", 10))
-        style.configure("Muted.TLabel", background=BG, foreground=MUTED, font=("Segoe UI", 9))
-        style.configure("Panel.TLabel", background=PANEL, foreground=TEXT, font=("Segoe UI", 10))
-        style.configure("Title.TLabel", background=BG, foreground=TEXT, font=("Segoe UI Semibold", 18))
-        style.configure("TButton", font=("Segoe UI", 10), padding=(10, 7))
-        style.configure("Accent.TButton", background=ACCENT, foreground="#0b1220", font=("Segoe UI Semibold", 10))
-        style.map("Accent.TButton", background=[("active", "#9bbdff"), ("disabled", "#536782")])
-        style.configure("Treeview", background=PANEL, fieldbackground=PANEL, foreground=TEXT, rowheight=29, borderwidth=0)
-        style.configure("Treeview.Heading", background=PANEL_2, foreground=TEXT, font=("Segoe UI Semibold", 9))
-        style.map("Treeview", background=[("selected", "#304b70")], foreground=[("selected", TEXT)])
+            return None
 
+    def _apply_icon(self, window):
+        """Set Nova's icon. CustomTkinter swaps in its own icon ~200 ms after a
+        window opens unless iconbitmap() was called, so set it now and again later."""
+        if not self._icon_path:
+            return
+
+        def apply():
+            try:
+                window.iconbitmap(str(self._icon_path))
+            except tk.TclError:
+                pass
+
+        apply()
+        window.after(250, apply)
+
+    # -------------------- layout --------------------
     def _build_ui(self):
-        header = ttk.Frame(self.root, padding=(18, 14, 18, 12))
-        header.pack(fill="x")
-        left_head = ttk.Frame(header)
-        left_head.pack(side="left", fill="x", expand=True)
-        ttk.Label(left_head, text="Nova AI", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(left_head, text=f"Private desktop assistant  •  Model: {MODEL}  •  Runs locally", style="Muted.TLabel").pack(anchor="w", pady=(2, 0))
+        f = self.fonts
         self.status_var = tk.StringVar(value="Starting…")
-        self.status_label = ttk.Label(header, textvariable=self.status_var, style="Muted.TLabel")
-        self.status_label.pack(side="right", anchor="e")
 
-        body = ttk.Frame(self.root, padding=(14, 0, 14, 12))
-        body.pack(fill="both", expand=True)
+        shell = ctk.CTkFrame(self.root, fg_color=BG, corner_radius=0)
+        shell.pack(fill="both", expand=True)
 
-        sidebar = ttk.Frame(body, style="Panel.TFrame", padding=10, width=240)
-        sidebar.pack(side="left", fill="y", padx=(0, 12))
+        # Sidebar
+        sidebar = ctk.CTkFrame(shell, fg_color=SIDEBAR, corner_radius=0, width=272)
+        sidebar.pack(side="left", fill="y")
         sidebar.pack_propagate(False)
-        ttk.Label(sidebar, text="CONVERSATIONS", style="Panel.TLabel", font=("Segoe UI Semibold", 9)).pack(anchor="w", pady=(2, 8))
-        ttk.Button(sidebar, text="+ New chat", command=self.new_chat).pack(fill="x", pady=(0, 8))
-        self.session_tree = ttk.Treeview(sidebar, columns=("date",), show="tree", selectmode="browse", height=13)
-        self.session_tree.pack(fill="both", expand=True)
-        self.session_tree.bind("<<TreeviewSelect>>", self.on_session_select)
-        ttk.Separator(sidebar).pack(fill="x", pady=12)
-        ttk.Label(sidebar, text="LOCAL MEMORY", style="Panel.TLabel", font=("Segoe UI Semibold", 9)).pack(anchor="w", pady=(0, 6))
-        ttk.Label(sidebar, text="Only memories you explicitly save are stored.", style="Muted.TLabel", wraplength=205).pack(anchor="w")
-        ttk.Button(sidebar, text="Manage memories", command=self.open_memories).pack(fill="x", pady=(8, 0))
-        ttk.Button(sidebar, text="Notes & reminders", command=self.open_productivity).pack(fill="x", pady=(8, 0))
-        ttk.Button(sidebar, text="Startup & tray settings", command=self.open_startup_settings).pack(fill="x", pady=(8, 0))
 
-        main = ttk.Frame(body, style="Panel.TFrame", padding=12)
+        brand = ctk.CTkFrame(sidebar, fg_color="transparent")
+        brand.pack(fill="x", padx=18, pady=(20, 16))
+        ctk.CTkLabel(
+            brand, text="✦", width=32, height=32, corner_radius=10, fg_color=ACCENT,
+            text_color="#ffffff", font=ctk.CTkFont(family=f.symbol, size=16),
+        ).pack(side="left")
+        ctk.CTkLabel(brand, text="Nova", font=f.heading(21), text_color=TEXT).pack(side="left", padx=(10, 0))
+
+        NavButton(sidebar, f, Icon.ADD, "New chat", self.new_chat, filled=True).pack(fill="x", padx=12, pady=(0, 6))
+        self.session_list = SessionList(sidebar, f, on_select=self.select_session, on_delete=self.delete_chat)
+        self.session_list.pack(fill="both", expand=True, padx=(4, 0))
+
+        ctk.CTkFrame(sidebar, height=1, fg_color=BORDER, corner_radius=0).pack(fill="x", padx=16, pady=8)
+        NavButton(sidebar, f, Icon.MEMORY, "Memories", self.open_memories).pack(fill="x", padx=12, pady=1)
+        NavButton(sidebar, f, Icon.NOTE, "Notes & reminders", self.open_productivity).pack(fill="x", padx=12, pady=1)
+        NavButton(sidebar, f, Icon.SETTINGS, "Settings", self.open_startup_settings).pack(fill="x", padx=12, pady=1)
+        footer = ctk.CTkFrame(sidebar, fg_color="transparent")
+        footer.pack(fill="x", padx=24, pady=(10, 16))
+        ctk.CTkLabel(footer, text="●", font=ctk.CTkFont(family=f.symbol, size=9), text_color=SUCCESS, width=10).pack(side="left")
+        ctk.CTkLabel(footer, text=f"Running locally · {MODEL}", font=f.ui(12), text_color=SUBTLE).pack(side="left", padx=(6, 0))
+
+        # Main column
+        main = ctk.CTkFrame(shell, fg_color=BG, corner_radius=0)
         main.pack(side="left", fill="both", expand=True)
-        chat_head = ttk.Frame(main, style="Panel.TFrame")
-        chat_head.pack(fill="x", pady=(0, 8))
-        self.chat_title = ttk.Label(chat_head, text="Conversation", style="Panel.TLabel", font=("Segoe UI Semibold", 12))
-        self.chat_title.pack(side="left")
-        ttk.Label(chat_head, text="Chats and memories stay on this PC", style="Muted.TLabel").pack(side="right")
 
-        chat_container = ttk.Frame(main, style="Panel.TFrame")
-        chat_container.pack(fill="both", expand=True)
-        self.chat_text = tk.Text(
-            chat_container, wrap="word", state="disabled", bg=PANEL, fg=TEXT,
-            insertbackground=TEXT, selectbackground="#304b70", relief="flat",
-            borderwidth=0, padx=12, pady=12, font=("Segoe UI", 10),
-            spacing1=3, spacing3=9,
-        )
-        scrollbar = ttk.Scrollbar(chat_container, orient="vertical", command=self.chat_text.yview)
-        self.chat_text.configure(yscrollcommand=scrollbar.set)
-        self.chat_text.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-        self.chat_text.tag_configure("user_label", foreground="#a9c9ff", font=("Segoe UI Semibold", 10))
-        self.chat_text.tag_configure("assistant_label", foreground="#9de2c3", font=("Segoe UI Semibold", 10))
-        self.chat_text.tag_configure("body", foreground=TEXT, lmargin1=4, lmargin2=4, spacing3=10)
-        self.chat_text.tag_configure("system", foreground=MUTED, font=("Segoe UI", 9), lmargin1=4, lmargin2=4)
+        header = ctk.CTkFrame(main, fg_color=BG, corner_radius=0, height=62)
+        header.pack(fill="x")
+        header.pack_propagate(False)
+        self._full_title = "New conversation"
+        self._title_font = f.ui(16, semibold=True)
+        self.status_pill = StatusPill(header, f, self.status_var)
+        self.status_pill.pack(side="right", padx=22)
+        self.title_label = ctk.CTkLabel(header, text=self._full_title, font=self._title_font, text_color=TEXT, anchor="w")
+        self.title_label.pack(side="left", fill="x", expand=True, padx=(28, 12))
+        header.bind("<Configure>", lambda _e: self._fit_title(), add="+")
+        ctk.CTkFrame(main, height=1, fg_color=BORDER, corner_radius=0).pack(fill="x")
 
-        composer = ttk.Frame(main, style="Panel.TFrame")
-        composer.pack(fill="x", pady=(10, 0))
-        self.input_text = tk.Text(
-            composer, height=3, wrap="word", bg=PANEL_2, fg=TEXT,
-            insertbackground=TEXT, relief="flat", borderwidth=0,
-            padx=10, pady=9, font=("Segoe UI", 10),
+        # Composer is packed before the chat view so it can never be pushed off-screen.
+        bottom = ctk.CTkFrame(main, fg_color=BG, corner_radius=0)
+        bottom.pack(side="bottom", fill="x")
+        self.composer_wrap = ctk.CTkFrame(bottom, fg_color="transparent")
+        self.composer_wrap.pack(fill="x", padx=40, pady=(4, 16))
+
+        composer = ctk.CTkFrame(self.composer_wrap, fg_color=SURFACE, corner_radius=24, border_width=1, border_color=BORDER)
+        composer.pack(fill="x")
+        composer.grid_columnconfigure(0, weight=1)
+        self._input_font = f.ui(15)
+        self._line_height = self._input_font.metrics("linespace")
+        self.input_text = ctk.CTkTextbox(
+            composer, fg_color=SURFACE, text_color=TEXT, font=self._input_font,
+            height=self._line_height + 10, wrap="word", border_width=0,
+            corner_radius=0, activate_scrollbars=False,
         )
-        self.input_text.pack(side="left", fill="both", expand=True, padx=(0, 8))
-        self.input_text.bind("<Control-Return>", self._send_shortcut)
+        self.input_text.grid(row=0, column=0, sticky="ew", padx=(18, 6), pady=11)
+        self.placeholder = ctk.CTkLabel(
+            composer, text="Message Nova…", font=self._input_font,
+            text_color=SUBTLE, fg_color=SURFACE, height=self._line_height,
+        )
+        self.placeholder.bind("<Button-1>", lambda _e: self.input_text.focus_set())
+        set_cursor(self.placeholder, "xterm")
+
+        buttons = ctk.CTkFrame(composer, fg_color="transparent")
+        buttons.grid(row=0, column=1, sticky="se", padx=(0, 9), pady=8)
+        self.voice_button = icon_button(buttons, f, Icon.MIC, self.start_voice, size=38, icon_size=16, text_color_disabled=BORDER)
+        self.voice_button.pack(side="left", padx=(0, 6))
+        Tooltip(self.voice_button, "Speak to Nova", f)
+        self.send_button = icon_button(
+            buttons, f, Icon.SEND, self.send_text, size=38, icon_size=15,
+            fg=ACCENT, hover=ACCENT_HOVER, text_color="#ffffff", text_color_disabled=SUBTLE,
+        )
+        self.send_button.pack(side="left")
+        Tooltip(self.send_button, "Send (Enter)", f)
+
+        hints = ctk.CTkFrame(self.composer_wrap, fg_color="transparent")
+        hints.pack(fill="x", pady=(9, 0), padx=8)
+        self.wake_switch = ctk.CTkSwitch(
+            hints, text="Hey Nova", font=f.ui(13), text_color=MUTED,
+            command=self.toggle_wake_word, progress_color=ACCENT, fg_color=SURFACE_2,
+            button_color=TEXT, button_hover_color="#ffffff", switch_width=34, switch_height=18,
+        )
+        self.wake_switch.pack(side="left")
+        Tooltip(self.wake_switch, "Listen for “Hey Nova” — works offline", f)
+        ctk.CTkLabel(hints, text="Enter to send  ·  Shift+Enter for a new line", font=f.ui(12), text_color=SUBTLE).pack(side="right")
+
+        self.chat = ChatView(main, f, on_suggestion=self._use_suggestion)
+        self.chat.pack(fill="both", expand=True)
+        self.chat.bind("<Configure>", self._align_composer, add="+")
+
         self.input_text.bind("<Return>", self._enter_behavior)
-        controls = ttk.Frame(composer, style="Panel.TFrame")
-        controls.pack(side="right", fill="y")
-        self.voice_button = ttk.Button(controls, text="🎙 Voice", command=self.start_voice)
-        self.voice_button.pack(fill="x", pady=(0, 6))
-        self.wake_button = ttk.Button(controls, text="Hey Nova: OFF", command=self.toggle_wake_word)
-        self.wake_button.pack(fill="x", pady=(0, 6))
-        self.send_button = ttk.Button(controls, text="Send", style="Accent.TButton", command=self.send_text)
-        self.send_button.pack(fill="x")
-        ttk.Label(main, text="Enter to send • Shift+Enter for a new line • Ctrl+Enter to send", style="Muted.TLabel").pack(anchor="w", pady=(7, 0))
+        self.input_text.bind("<Control-Return>", self._send_shortcut)
+        for sequence in ("<KeyRelease>", "<FocusIn>", "<FocusOut>", "<<Paste>>"):
+            self.input_text.bind(sequence, lambda _e: self.root.after_idle(self._update_composer))
+        self.root.after(50, self._update_composer)
+
+    def _align_composer(self, _event=None):
+        """Keep the composer lined up with the chat's reading column."""
+        width = self.chat.winfo_width()
+        column = self.chat.column_width()
+        left = max(20, (width - 14 - column) // 2)
+        right = max(20, width - left - column)
+        self.composer_wrap.pack_configure(padx=(left, right))
+
+    def _update_composer(self):
+        """Grow the input box with its content (1–8 lines) and toggle the placeholder."""
+        try:
+            text = self.input_text.get("1.0", "end-1c")
+            inner = self.input_text._textbox
+            lines = inner.count("1.0", "end", "displaylines")
+            lines = lines[0] if isinstance(lines, tuple) else (lines or 1)
+        except tk.TclError:
+            return
+        lines = max(1, min(8, int(lines)))
+        self.input_text.configure(height=lines * self._line_height + 10)
+        if text:
+            self.placeholder.place_forget()
+        else:
+            self.placeholder.place(in_=self.input_text, x=6, y=4)
+
+    def _use_suggestion(self, suggestion):
+        if self.busy:
+            return
+        self.input_text.delete("1.0", "end")
+        self.input_text.insert("1.0", suggestion)
+        self.input_text.focus_set()
+        self._update_composer()
 
     def set_status(self, value):
         self.status_var.set(value)
-
-    def append_message(self, role, content):
-        self.chat_text.configure(state="normal")
-        if role == "user":
-            self.chat_text.insert("end", "You\n", "user_label")
-        elif role == "assistant":
-            self.chat_text.insert("end", "Nova\n", "assistant_label")
+        lower = str(value).lower()
+        if "fail" in lower or "error" in lower:
+            color = DANGER
+        elif self.busy or any(word in lower for word in (
+            "listening", "transcrib", "thinking", "working", "starting", "stopping", "speak", "loading",
+        )):
+            color = WARNING
+        elif self.wake_active:
+            color = ACCENT
         else:
-            self.chat_text.insert("end", "Info\n", "system")
-        self.chat_text.insert("end", content.rstrip() + "\n\n", "body" if role in ("user", "assistant") else "system")
-        self.chat_text.configure(state="disabled")
-        self.chat_text.see("end")
+            color = SUCCESS
+        self.status_pill.set_color(color)
+
+    # -------------------- conversation view --------------------
+    def append_message(self, role, content):
+        if role == "user":
+            self.chat.add_user(content)
+        elif role == "assistant":
+            self.chat.add_assistant(content)
+        else:
+            self.chat.add_info(content)
 
     def clear_chat_view(self):
-        self.chat_text.configure(state="normal")
-        self.chat_text.delete("1.0", "end")
-        self.chat_text.configure(state="disabled")
+        self.chat.clear()
 
     def load_chat(self):
-        self.clear_chat_view()
         items = fetch_messages(self.session_id)
         if not items:
-            self.append_message("system", "Hi, I'm Nova. Ask a question or press Voice to speak. Everything is processed locally.")
+            self.chat.show_welcome(self.SUGGESTIONS)
         else:
+            self.chat.clear()
             for role, content in items:
                 self.append_message(role, content)
-        self.chat_title.configure(text=f"Conversation #{self.session_id}")
+            self.root.update_idletasks()
+            self.chat.scroll_to_end()
+        self._update_title()
+
+    def _update_title(self):
+        self._full_title = next(
+            (label for sid, label, _date in self.sessions if sid == self.session_id),
+            "New conversation",
+        )
+        self._fit_title()
+
+    def _fit_title(self):
+        """Fit the conversation title into the header space left of the status pill."""
+        header = self.title_label.master
+        available = header.winfo_width() - self.status_pill.winfo_width() - 28 - 12 - 44
+        if available < 100:
+            available = 600
+        self.title_label.configure(text=fit_text(self._full_title, self._title_font, available))
 
     def refresh_sessions(self, select_current=False):
         self.sessions = fetch_sessions()
-        self.session_tree.delete(*self.session_tree.get_children())
-        for sid, label, created in self.sessions:
-            display = label if label and not label.startswith("Chat ") else f"Chat {sid}"
-            if created:
-                display = f"{display}  ·  {created[:10]}"
-            self.session_tree.insert("", "end", iid=str(sid), text=display)
-        if select_current and self.session_id is not None and self.session_tree.exists(str(self.session_id)):
-            self.session_tree.selection_set(str(self.session_id))
-            self.session_tree.see(str(self.session_id))
+        self.session_list.set_sessions(self.sessions, self.session_id)
+        self._update_title()
 
-    def on_session_select(self, _event=None):
-        selected = self.session_tree.selection()
-        if not selected:
-            return
-        try:
-            new_id = int(selected[0])
-        except ValueError:
-            new_id = selected[0]
-        if new_id == self.session_id:
+    def select_session(self, session_id):
+        if session_id == self.session_id:
             return
         if self.busy:
-            # Keep the sidebar in sync with the chat being shown: the running
-            # reply belongs to the current conversation. Re-selecting fires
-            # this handler again, where new_id == session_id makes it a no-op.
-            if self.session_tree.exists(str(self.session_id)):
-                self.session_tree.selection_set(str(self.session_id))
-            else:
-                self.session_tree.selection_remove(selected)
+            # The running reply belongs to the open conversation; stay on it.
             self.set_status("Wait for Nova to finish before switching conversations")
             return
-        self.session_id = new_id
+        self.session_id = session_id
+        self.session_list.set_selected(session_id)
         self.load_chat()
 
     def new_chat(self):
         if self.busy:
             self.set_status("Wait for Nova to finish before starting a new chat")
             return
+        # Reuse the open chat if it's still empty instead of piling up blank ones.
+        if self.session_id is not None and not fetch_messages(self.session_id):
+            self.load_chat()
+            self.input_text.focus_set()
+            return
         self.session_id = new_session_id()
         if self.session_id is None:
-            messagebox.showerror("Nova AI", "Could not create a new conversation.")
+            messagebox.showerror("Nova", "Could not create a new conversation.", parent=self.root)
             return
         self.refresh_sessions(select_current=True)
         self.load_chat()
-        self.set_status("New conversation ready")
+        self.set_status("Ready")
+        self.input_text.focus_set()
+
+    def delete_chat(self, session_id=None):
+        """Permanently delete a conversation (the open one by default)."""
+        if self.busy:
+            self.set_status("Wait for Nova to finish before deleting a chat")
+            return
+        if session_id is None:
+            session_id = self.session_id
+        if session_id is None:
+            return
+
+        title = next(
+            (label for sid, label, _date in self.sessions if sid == session_id),
+            f"Chat {session_id}",
+        )
+        count = len(fetch_messages(session_id))
+        if not messagebox.askyesno(
+            "Delete chat",
+            f"Delete “{title}”?\n\n"
+            f"Its {count} message{'s' if count != 1 else ''} will be permanently "
+            "deleted. This can't be undone.",
+            icon="warning",
+            parent=self.root,
+        ):
+            return
+
+        try:
+            backend.delete_session(session_id)
+        except Exception as exc:
+            messagebox.showerror("Delete chat", f"Couldn't delete the chat: {exc}", parent=self.root)
+            return
+
+        if session_id == self.session_id:
+            # Open the most recent remaining chat, or start a fresh one.
+            remaining = fetch_sessions()
+            self.session_id = remaining[0][0] if remaining else new_session_id()
+            self.load_chat()
+        self.refresh_sessions(select_current=True)
+        self.set_status("Chat deleted")
 
     def _enter_behavior(self, event):
         if event.state & 0x1:  # Shift+Enter inserts newline
+            self.root.after_idle(self._update_composer)
             return None
         self.send_text()
         return "break"
@@ -1126,6 +1284,7 @@ class NovaGUI:
         self.send_text()
         return "break"
 
+    # -------------------- requests --------------------
     def handle_user_message(self, text, speak=False):
         """Handle local productivity and allowlisted Windows actions before model chat.
 
@@ -1168,7 +1327,7 @@ class NovaGUI:
         self.busy = False
         self.set_controls_enabled(True)
         self.append_message("assistant", action_result)
-        self.set_status("Action completed • Local mode")
+        self.set_status("Ready")
         self.refresh_sessions(select_current=True)
         if speak:
             def speak_worker():
@@ -1198,28 +1357,37 @@ class NovaGUI:
         if not text:
             return
         self.input_text.delete("1.0", "end")
+        self._update_composer()
         self.append_message("user", text)
         self.handle_user_message(text, speak=False)
+
+    # -------------------- voice --------------------
+    def _sync_wake_switch(self):
+        if self.wake_active:
+            self.wake_switch.select()
+        else:
+            self.wake_switch.deselect()
 
     def toggle_wake_word(self):
         if self.wake_active:
             self.wake_active = False
             self.wake_stop_event.set()
             self.wake_resume_event.set()
-            self.wake_button.configure(text="Hey Nova: OFF")
+            self._sync_wake_switch()
             self.set_controls_enabled(not self.busy)
             self.set_status("Stopping wake-word listener…")
             return
         if self.busy:
-            messagebox.showinfo("Hey Nova", "Wait for the current task to finish before enabling wake-word mode.")
+            self._sync_wake_switch()
+            messagebox.showinfo("Hey Nova", "Wait for the current task to finish before enabling wake-word mode.", parent=self.root)
             return
         self.wake_active = True
         self.wake_stop_event.clear()
         self.wake_resume_event.clear()
-        self.wake_button.configure(text="Hey Nova: ON")
+        self._sync_wake_switch()
         self.set_controls_enabled(True)  # disables Voice while wake mode is on
-        self.set_status("Starting offline wake-word listener…")
-        self.events.put(("system", "Wake-word mode is on. Say “Hey Nova”, then speak your command after detection."))
+        self.set_status("Starting wake-word listener…")
+        self.events.put(("system", "Wake-word mode is on. Say “Hey Nova”, then speak your command."))
         self.wake_thread = threading.Thread(target=self._wake_worker, daemon=True)
         self.wake_thread.start()
 
@@ -1250,7 +1418,6 @@ class NovaGUI:
         self.voice_response = True
         self.set_controls_enabled(False)
         self.set_status("Listening…")
-        self.events.put(("system", "Voice mode started. Speak clearly after the microphone opens."))
         threading.Thread(target=self._voice_worker, daemon=True).start()
 
     def _voice_worker(self):
@@ -1260,13 +1427,14 @@ class NovaGUI:
         except Exception as exc:
             self.events.put(("voice_error", str(exc)))
 
+    # -------------------- model replies --------------------
     def begin_generation(self, user_text, speak=False):
         if self.busy:
             return
         self.busy = True
         self.voice_response = speak
         self.set_controls_enabled(False)
-        self.set_status("Thinking locally…")
+        self.set_status("Thinking…")
         self.events.put(("assistant_start", None))
         threading.Thread(target=self._generation_worker, args=(self.session_id, user_text, speak), daemon=True).start()
 
@@ -1280,7 +1448,7 @@ class NovaGUI:
             # Like backend.load_context(): the context must start with a user turn.
             while history and history[0][0] != "user":
                 history.pop(0)
-            messages =[{"role": "system", "content": system_prompt(user_text)}]
+            messages = [{"role": "system", "content": system_prompt(user_text)}]
             messages.extend({"role": role, "content": content} for role, content in history)
             response_parts = []
             stream = ollama.chat(
@@ -1324,15 +1492,12 @@ class NovaGUI:
 
     def set_controls_enabled(self, enabled):
         state = "normal" if enabled else "disabled"
-        self.send_button.configure(state=state)
+        self.send_button.configure(state=state, fg_color=ACCENT if enabled else SURFACE_2)
         # Voice and Hey Nova share the microphone; never allow both at once.
         self.voice_button.configure(
             state="normal" if enabled and not self.wake_active else "disabled"
         )
-        if enabled:
-            self.input_text.configure(state="normal")
-        else:
-            self.input_text.configure(state="disabled")
+        self.input_text.configure(state=state)
 
     def poll_events(self):
         try:
@@ -1343,16 +1508,9 @@ class NovaGUI:
                 elif event == "system":
                     self.append_message("system", payload)
                 elif event == "assistant_start":
-                    self.chat_text.configure(state="normal")
-                    self.chat_text.insert("end", "Nova\n", "assistant_label")
-                    self.chat_text.configure(state="disabled")
-                    self._stream_start = True
-                    self.chat_text.see("end")
+                    self.chat.begin_assistant()
                 elif event == "token":
-                    self.chat_text.configure(state="normal")
-                    self.chat_text.insert("end", payload, "body")
-                    self.chat_text.configure(state="disabled")
-                    self.chat_text.see("end")
+                    self.chat.stream(payload)
                 elif event == "action_done":
                     self.finish_action(*payload)
                 elif event == "action_none":
@@ -1372,28 +1530,28 @@ class NovaGUI:
                         self.wake_resume_event.set()
                         continue
                     self.set_status("Wake phrase heard • confirm command")
-                    if messagebox.askyesno("Confirm voice input", f"Send this transcript to Nova?\n\n{payload}"):
+                    if messagebox.askyesno("Confirm voice input", f"Send this to Nova?\n\n{payload}", parent=self.root):
                         self.append_message("user", payload)
                         self.handle_user_message(payload, speak=True)
                     else:
-                        self.set_status("Command cancelled • wake word remains active")
+                        self.set_status("Command cancelled • still listening for Hey Nova")
                         self.wake_resume_event.set()
                 elif event == "wake_voice_error":
                     self.set_status("Wake-word voice capture failed")
-                    messagebox.showerror("Wake-word voice input", payload)
+                    messagebox.showerror("Hey Nova", payload, parent=self.root)
                     self.wake_resume_event.set()
                 elif event == "wake_setup_error":
                     self.wake_active = False
                     self.wake_stop_event.set()
-                    self.wake_button.configure(text="Hey Nova: OFF")
+                    self._sync_wake_switch()
                     self.set_controls_enabled(not self.busy)
                     self.set_status("Wake-word setup failed")
-                    messagebox.showerror("Hey Nova setup", payload)
+                    messagebox.showerror("Hey Nova setup", payload, parent=self.root)
                 elif event == "transcript_ready":
                     self.busy = False
                     self.set_controls_enabled(True)
                     self.set_status("Transcript ready")
-                    if messagebox.askyesno("Confirm voice input", f"Send this transcript to Nova?\n\n{payload}"):
+                    if messagebox.askyesno("Confirm voice input", f"Send this to Nova?\n\n{payload}", parent=self.root):
                         self.append_message("user", payload)
                         self.handle_user_message(payload, speak=True)
                     else:
@@ -1401,111 +1559,177 @@ class NovaGUI:
                 elif event == "voice_error":
                     self.busy = False
                     self.set_controls_enabled(True)
-                    self.set_status("Ready • Voice input failed")
-                    messagebox.showerror("Voice input", payload)
+                    self.set_status("Voice input failed")
+                    messagebox.showerror("Voice input", payload, parent=self.root)
                 elif event == "generation_done":
+                    self.chat.end_assistant()
                     self.busy = False
                     self.set_controls_enabled(True)
-                    self.set_status("Ready • Local mode")
+                    self.set_status("Ready")
                     self.refresh_sessions(select_current=True)
                     if self.wake_active:
                         self.wake_resume_event.set()
                 elif event == "generation_error":
+                    self.chat.end_assistant()
                     self.busy = False
                     self.set_controls_enabled(True)
-                    self.set_status("Error • Check local services")
-                    self.append_message("system", payload)
-                    messagebox.showerror("Nova AI", payload)
+                    self.set_status("Error • check that Ollama is running")
+                    self.chat.add_info(payload.split("\n")[0], error=True)
+                    messagebox.showerror("Nova", payload, parent=self.root)
                     if self.wake_active:
                         self.wake_resume_event.set()
         except queue.Empty:
             pass
         self.root.after(100, self.poll_events)
 
+    # -------------------- dialogs: shared pieces --------------------
     def refresh_memories(self):
         try:
             self.memory_rows = get_memories()
         except Exception:
             self.memory_rows = []
 
-    def open_memories(self):
-        win = tk.Toplevel(self.root)
-        win.title("Nova — Long-term memory")
-        win.geometry("680x480")
-        win.configure(bg=BG)
+    def _dialog(self, title, geometry, minsize=None, resizable=True):
+        win = ctk.CTkToplevel(self.root, fg_color=BG)
+        win.title(f"{title} — Nova")
+        win.geometry(geometry)
+        if minsize:
+            win.minsize(*minsize)
+        if not resizable:
+            win.resizable(False, False)
         win.transient(self.root)
-        frame = ttk.Frame(win, padding=14)
-        frame.pack(fill="both", expand=True)
-        ttk.Label(frame, text="Long-term memory", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(frame, text="Only facts you explicitly add here are saved for future chats.", style="Muted.TLabel").pack(anchor="w", pady=(2, 10))
-        tree = ttk.Treeview(frame, columns=("category", "content", "updated"), show="headings", selectmode="browse")
-        tree.heading("category", text="Category")
-        tree.heading("content", text="Memory")
-        tree.heading("updated", text="Updated")
-        tree.column("category", width=105, stretch=False)
-        tree.column("content", width=390)
-        tree.column("updated", width=105, stretch=False)
-        tree.pack(fill="both", expand=True)
+        self._apply_icon(win)
+        # CTkToplevel can open behind the main window on Windows.
+        win.after(80, lambda: (win.lift(), win.focus_force()))
+        return win
+
+    def _dialog_header(self, parent, title, subtitle):
+        ctk.CTkLabel(parent, text=title, font=self.fonts.heading(24), text_color=TEXT, anchor="w").pack(fill="x")
+        ctk.CTkLabel(
+            parent, text=subtitle, font=self.fonts.ui(13), text_color=MUTED,
+            anchor="w", justify="left", wraplength=640,
+        ).pack(fill="x", pady=(3, 16))
+
+    def _entry(self, master, placeholder, width=200, font_size=14, **kwargs):
+        options = dict(
+            placeholder_text=placeholder, width=width, height=40, corner_radius=10,
+            fg_color=SURFACE_2, border_color=BORDER, border_width=1, text_color=TEXT,
+            placeholder_text_color=SUBTLE, font=self.fonts.ui(font_size),
+        )
+        options.update(kwargs)
+        return ctk.CTkEntry(master, **options)
+
+    def _button(self, master, text, command, kind="primary", width=110):
+        fg, hover, text_color = {
+            "primary": (ACCENT, ACCENT_HOVER, "#ffffff"),
+            "secondary": (SURFACE_2, BORDER, TEXT),
+            "danger": (DANGER_SOFT, "#4a272c", DANGER),
+        }[kind]
+        return ctk.CTkButton(
+            master, text=text, command=command, width=width, height=40, corner_radius=10,
+            fg_color=fg, hover_color=hover, text_color=text_color,
+            font=self.fonts.ui(14, semibold=True),
+        )
+
+    def _chip(self, master, text, fg, text_color):
+        return ctk.CTkLabel(
+            master, text=f"  {text}  ", font=self.fonts.ui(12, semibold=True),
+            fg_color=fg, text_color=text_color, corner_radius=8, height=22,
+        )
+
+    def _scroll_list(self, master):
+        frame = ctk.CTkScrollableFrame(
+            master, fg_color="transparent", corner_radius=0,
+            scrollbar_button_color=SURFACE_2, scrollbar_button_hover_color=BORDER,
+        )
+        autohide_scrollbar(frame)
+        return frame
+
+    def _empty_state(self, master, glyph, title, subtitle):
+        box = ctk.CTkFrame(master, fg_color="transparent")
+        box.pack(fill="x", pady=40)
+        ctk.CTkLabel(box, text=glyph, font=self.fonts.icon(28), text_color=SUBTLE).pack()
+        ctk.CTkLabel(box, text=title, font=self.fonts.ui(15, semibold=True), text_color=TEXT).pack(pady=(10, 2))
+        ctk.CTkLabel(box, text=subtitle, font=self.fonts.ui(13), text_color=MUTED, wraplength=360).pack()
+
+    # -------------------- Memories --------------------
+    def open_memories(self):
+        f = self.fonts
+        win = self._dialog("Memories", "640x640", (520, 460))
+        body = ctk.CTkFrame(win, fg_color=BG)
+        body.pack(fill="both", expand=True, padx=26, pady=22)
+        self._dialog_header(
+            body, "Memories",
+            "Facts you save here are shared with Nova in future chats. Nothing is saved automatically.",
+        )
+
+        form = ctk.CTkFrame(body, fg_color=SURFACE, corner_radius=14)
+        form.pack(fill="x")
+        category = self._entry(form, "Category", width=130)
+        category.insert(0, "general")
+        category.pack(side="left", padx=(12, 6), pady=12)
+        content = self._entry(form, "e.g. I prefer short, practical answers")
+        content.pack(side="left", fill="x", expand=True, padx=6, pady=12)
+
+        items = self._scroll_list(body)
+        items.pack(fill="both", expand=True, pady=(14, 0))
 
         def refresh():
-            tree.delete(*tree.get_children())
-            for row in get_memories():
-                try:
-                    tree.insert("", "end", iid=str(row[0]), values=(row[1], row[2], format_timestamp(row[3])))
-                except Exception:
-                    pass
+            for child in items.winfo_children():
+                child.destroy()
+            rows = get_memories()
+            if not rows:
+                self._empty_state(items, Icon.MEMORY, "No memories yet",
+                                  "Add facts about yourself above, like your name or how you like answers.")
+                return
+            for row in rows:
+                memory_id, memory_category, memory_text, updated = row[0], row[1], row[2], row[3]
+                card = ctk.CTkFrame(items, fg_color=SURFACE, corner_radius=12)
+                card.pack(fill="x", pady=4, padx=(0, 8))
+                top = ctk.CTkFrame(card, fg_color="transparent")
+                top.pack(fill="x", padx=14, pady=(10, 0))
+                self._chip(top, memory_category, ACCENT_SOFT, ACCENT).pack(side="left")
+                ctk.CTkLabel(top, text=format_timestamp(updated), font=f.ui(12), text_color=SUBTLE).pack(side="left", padx=10)
+                remove = icon_button(top, f, Icon.DELETE, lambda mid=memory_id: delete(mid),
+                                     size=28, icon_size=12, hover=DANGER_SOFT, text_color=SUBTLE)
+                remove.pack(side="right")
+                Tooltip(remove, "Delete memory", f)
+                ctk.CTkLabel(
+                    card, text=memory_text, font=f.ui(14), text_color=TEXT,
+                    anchor="w", justify="left", wraplength=500,
+                ).pack(fill="x", padx=14, pady=(6, 12))
 
-        form = ttk.Frame(frame)
-        form.pack(fill="x", pady=(10, 0))
-        category_var = tk.StringVar(value="general")
-        content_var = tk.StringVar()
-        ttk.Label(form, text="Category").grid(row=0, column=0, sticky="w", padx=(0, 6))
-        ttk.Entry(form, textvariable=category_var, width=16).grid(row=0, column=1, sticky="ew", padx=(0, 10))
-        ttk.Label(form, text="Memory").grid(row=0, column=2, sticky="w", padx=(0, 6))
-        entry = ttk.Entry(form, textvariable=content_var)
-        entry.grid(row=0, column=3, sticky="ew")
-        form.columnconfigure(3, weight=1)
-
-        def add():
-            content = content_var.get().strip()
-            if not content:
-                messagebox.showwarning("Memory", "Enter a memory to save.", parent=win)
+        def add(_event=None):
+            text = content.get().strip()
+            if not text:
+                content.focus_set()
                 return
             try:
-                created = add_memory_db(category_var.get(), content)
-                content_var.set("")
+                created = add_memory_db(category.get(), text)
+                content.delete(0, "end")
                 refresh()
-                self.set_status(
-                    "Memory saved locally" if created
-                    else "Memory already saved • moved to top"
-                )
+                self.set_status("Memory saved" if created else "Memory already saved • moved to top")
             except ValueError as exc:
-                messagebox.showwarning("Memory", str(exc), parent=win)
+                messagebox.showwarning("Memories", str(exc), parent=win)
             except Exception as exc:
-                messagebox.showerror("Memory", str(exc), parent=win)
+                messagebox.showerror("Memories", str(exc), parent=win)
 
-        def delete():
-            selected = tree.selection()
-            if not selected:
-                return
-            if not messagebox.askyesno("Delete memory", "Delete the selected memory?", parent=win):
+        def delete(memory_id):
+            if not messagebox.askyesno("Delete memory", "Delete this memory?", parent=win):
                 return
             try:
-                delete_memory_db(int(selected[0]))
+                delete_memory_db(memory_id)
                 refresh()
                 self.set_status("Memory deleted")
             except Exception as exc:
-                messagebox.showerror("Memory", str(exc), parent=win)
+                messagebox.showerror("Memories", str(exc), parent=win)
 
-        buttons = ttk.Frame(frame)
-        buttons.pack(fill="x", pady=(8, 0))
-        ttk.Button(buttons, text="Save memory", command=add).pack(side="left")
-        ttk.Button(buttons, text="Delete selected", command=delete).pack(side="left", padx=8)
-        ttk.Button(buttons, text="Close", command=win.destroy).pack(side="right")
+        self._button(form, "Save", add, width=80).pack(side="right", padx=(6, 12), pady=12)
+        content.bind("<Return>", add)
         refresh()
-        entry.focus_set()
+        win.after(120, content.focus_set)
 
-
+    # -------------------- Reminders (polling) --------------------
     def poll_due_reminders(self):
         """Check due reminders on Tk's main thread; persist notification state first."""
         try:
@@ -1513,7 +1737,7 @@ class NovaGUI:
             due = claim_due_reminders_db(now_text)
             for reminder in due:
                 reminder_id, title, due_at = reminder[0], reminder[1], reminder[2]
-                self.set_status(f"Reminder due: {title}")
+                self.set_status(f"Reminder: {title}")
                 messagebox.showinfo(
                     "Nova reminder",
                     f"{title}\n\nScheduled for: {due_at}",
@@ -1528,231 +1752,241 @@ class NovaGUI:
             except tk.TclError:
                 pass
 
+    # -------------------- Notes & reminders --------------------
     def open_productivity(self):
         """Open local Notes and Reminders manager."""
-        win = tk.Toplevel(self.root)
-        win.title("Nova — Notes & reminders")
-        win.geometry("860x600")
-        win.minsize(720, 480)
-        win.configure(bg=BG)
-        win.transient(self.root)
-
-        outer = ttk.Frame(win, padding=14)
-        outer.pack(fill="both", expand=True)
-        ttk.Label(outer, text="Notes & reminders", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(
-            outer,
-            text="Stored locally in Nova's existing SQLite database. Reminder times use this PC's local time.",
-            style="Muted.TLabel",
-        ).pack(anchor="w", pady=(2, 10))
-
-        tabs = ttk.Notebook(outer)
+        f = self.fonts
+        win = self._dialog("Notes & reminders", "960x660", (800, 540))
+        body = ctk.CTkFrame(win, fg_color=BG)
+        body.pack(fill="both", expand=True, padx=26, pady=(22, 18))
+        self._dialog_header(
+            body, "Notes & reminders",
+            "Saved on this PC. Reminders pop up at their due time while Nova is running, including from the tray.",
+        )
+        tabs = ctk.CTkTabview(
+            body, fg_color=BG, corner_radius=12, anchor="w",
+            segmented_button_fg_color=SURFACE, segmented_button_selected_color=ACCENT,
+            segmented_button_selected_hover_color=ACCENT_HOVER,
+            segmented_button_unselected_color=SURFACE, segmented_button_unselected_hover_color=SURFACE_2,
+            text_color=TEXT,
+        )
         tabs.pack(fill="both", expand=True)
+        notes_tab = tabs.add("Notes")
+        reminders_tab = tabs.add("Reminders")
+        try:
+            tabs._segmented_button.configure(font=f.ui(13, semibold=True), height=34)
+        except Exception:
+            pass
 
-        # Notes tab
-        notes_tab = ttk.Frame(tabs, padding=10)
-        tabs.add(notes_tab, text="Notes")
-        note_tree = ttk.Treeview(
-            notes_tab, columns=("title", "updated"), show="headings", selectmode="browse", height=8
+        # ---- Notes ----
+        notes_tab.grid_columnconfigure(1, weight=1)
+        notes_tab.grid_rowconfigure(1, weight=1)
+        selected = {"id": None}
+
+        left = ctk.CTkFrame(notes_tab, fg_color="transparent", width=290)
+        left.grid(row=0, column=0, rowspan=2, sticky="nsw", padx=(0, 14), pady=(8, 0))
+        left.grid_propagate(False)
+        left.pack_propagate(False)
+        note_list = self._scroll_list(left)
+
+        editor = ctk.CTkFrame(notes_tab, fg_color=SURFACE, corner_radius=14)
+        editor.grid(row=0, column=1, rowspan=2, sticky="nsew", pady=(8, 0))
+        title_entry = self._entry(editor, "Title", font_size=18, fg_color=SURFACE, border_width=0, height=46)
+        title_entry.pack(fill="x", padx=12, pady=(10, 0))
+        ctk.CTkFrame(editor, height=1, fg_color=BORDER).pack(fill="x", padx=18, pady=(2, 4))
+        content_box = ctk.CTkTextbox(
+            editor, fg_color=SURFACE, text_color=TEXT, font=f.ui(14), wrap="word",
+            border_width=0, scrollbar_button_color=SURFACE_2, scrollbar_button_hover_color=BORDER,
         )
-        note_tree.heading("title", text="Title")
-        note_tree.heading("updated", text="Last updated")
-        note_tree.column("title", width=510)
-        note_tree.column("updated", width=150, stretch=False)
-        note_tree.pack(fill="both", expand=True)
+        content_box.pack(fill="both", expand=True, padx=12, pady=(0, 6))
+        actions = ctk.CTkFrame(editor, fg_color="transparent")
+        actions.pack(fill="x", padx=14, pady=(0, 14))
+        meta = ctk.CTkLabel(actions, text="New note", font=f.ui(12), text_color=SUBTLE)
+        meta.pack(side="left")
 
-        note_form = ttk.Frame(notes_tab)
-        note_form.pack(fill="both", expand=False, pady=(10, 0))
-        ttk.Label(note_form, text="Title").grid(row=0, column=0, sticky="w", padx=(0, 8))
-        note_title = tk.StringVar()
-        ttk.Entry(note_form, textvariable=note_title).grid(row=0, column=1, sticky="ew")
-        ttk.Label(note_form, text="Content").grid(row=1, column=0, sticky="nw", padx=(0, 8), pady=(8, 0))
-        note_content = tk.Text(
-            note_form, height=5, wrap="word", bg=PANEL_2, fg=TEXT,
-            insertbackground=TEXT, relief="flat", borderwidth=0, padx=8, pady=7,
-        )
-        note_content.grid(row=1, column=1, sticky="nsew", pady=(8, 0))
-        note_form.columnconfigure(1, weight=1)
-
-        selected_note_id = {"value": None}
-
-        def refresh_notes(select_id=None):
-            note_tree.delete(*note_tree.get_children())
-            for row in list_notes_db():
-                note_tree.insert("", "end", iid=str(row[0]), values=(row[1], format_timestamp(row[4] or row[3])))
-            if select_id is not None and note_tree.exists(str(select_id)):
-                note_tree.selection_set(str(select_id))
-
-        def load_selected_note(_event=None):
-            selection = note_tree.selection()
-            if not selection:
+        def load_note(note_id):
+            row = next((r for r in list_notes_db() if int(r[0]) == note_id), None)
+            if row is None:
                 return
-            try:
-                note_id = int(selection[0])
-                row = next((r for r in list_notes_db() if int(r[0]) == note_id), None)
-                if row is None:
-                    return
-                selected_note_id["value"] = note_id
-                note_title.set(str(row[1]))
-                note_content.delete("1.0", "end")
-                note_content.insert("1.0", str(row[2] or ""))
-            except Exception as exc:
-                messagebox.showerror("Notes", str(exc), parent=win)
+            selected["id"] = note_id
+            title_entry.delete(0, "end")
+            title_entry.insert(0, str(row[1]))
+            content_box.delete("1.0", "end")
+            content_box.insert("1.0", str(row[2] or ""))
+            meta.configure(text=f"Last edited {format_timestamp(row[4] or row[3])}")
+            refresh_notes()
 
-        note_tree.bind("<<TreeviewSelect>>", load_selected_note)
+        def refresh_notes():
+            for child in note_list.winfo_children():
+                child.destroy()
+            rows = list_notes_db()
+            if not rows:
+                self._empty_state(note_list, Icon.NOTE, "No notes yet",
+                                  "Write one on the right, or type “note: Title | text” in a chat.")
+            card_font = f.ui(14, semibold=True)
+            for row in rows:
+                note_id = int(row[0])
+                active = note_id == selected["id"]
+                card = ctk.CTkFrame(note_list, fg_color=SURFACE_2 if active else SURFACE, corner_radius=12)
+                card.pack(fill="x", pady=3, padx=(0, 8))
+                ctk.CTkLabel(card, text=fit_text(row[1], card_font, 220), font=card_font,
+                             text_color=TEXT, anchor="w").pack(fill="x", padx=14, pady=(10, 0))
+                preview = " ".join(str(row[2] or "").split()) or "No content"
+                ctk.CTkLabel(card, text=fit_text(preview, f.ui(12), 220), font=f.ui(12),
+                             text_color=MUTED, anchor="w").pack(fill="x", padx=14)
+                ctk.CTkLabel(card, text=format_timestamp(row[4] or row[3]), font=f.ui(11),
+                             text_color=SUBTLE, anchor="w").pack(fill="x", padx=14, pady=(0, 10))
+                bind_tree(card, "<Button-1>", lambda _e, nid=note_id: load_note(nid))
+                set_cursor(card)
 
-        def clear_note_form():
-            selected_note_id["value"] = None
-            note_title.set("")
-            note_content.delete("1.0", "end")
-            note_tree.selection_remove(note_tree.selection())
+        def new_note():
+            selected["id"] = None
+            title_entry.delete(0, "end")
+            content_box.delete("1.0", "end")
+            meta.configure(text="New note")
+            refresh_notes()
+            title_entry.focus_set()
 
         def save_note():
-            title = note_title.get().strip()
-            content = note_content.get("1.0", "end").strip()
+            title = title_entry.get().strip()
+            text = content_box.get("1.0", "end").strip()
             if not title:
-                messagebox.showwarning("Notes", "Enter a note title.", parent=win)
+                messagebox.showwarning("Notes", "Give the note a title.", parent=win)
+                title_entry.focus_set()
                 return
             try:
-                note_id = save_note_db(title, content, selected_note_id["value"])
-                selected_note_id["value"] = note_id
-                refresh_notes(note_id)
-                self.set_status("Note saved locally")
+                selected["id"] = save_note_db(title, text, selected["id"])
+                meta.configure(text="Saved just now")
+                refresh_notes()
+                self.set_status("Note saved")
             except Exception as exc:
                 messagebox.showerror("Notes", str(exc), parent=win)
 
         def delete_note():
-            note_id = selected_note_id["value"]
-            if note_id is None:
-                selection = note_tree.selection()
-                if selection:
-                    note_id = int(selection[0])
-            if note_id is None:
-                messagebox.showinfo("Notes", "Select a note to delete.", parent=win)
+            if selected["id"] is None:
+                new_note()
                 return
             if not messagebox.askyesno("Delete note", "Permanently delete this note?", parent=win):
                 return
             try:
-                delete_note_db(note_id)
-                clear_note_form()
-                refresh_notes()
+                delete_note_db(selected["id"])
+                new_note()
                 self.set_status("Note deleted")
             except Exception as exc:
                 messagebox.showerror("Notes", str(exc), parent=win)
 
-        note_buttons = ttk.Frame(notes_tab)
-        note_buttons.pack(fill="x", pady=(8, 0))
-        ttk.Button(note_buttons, text="New note", command=clear_note_form).pack(side="left")
-        ttk.Button(note_buttons, text="Save note", command=save_note).pack(side="left", padx=6)
-        ttk.Button(note_buttons, text="Delete selected", command=delete_note).pack(side="left")
+        self._button(left, "+  New note", new_note, kind="secondary").pack(fill="x", pady=(0, 10))
+        note_list.pack(fill="both", expand=True)
+        self._button(actions, "Save", save_note, width=96).pack(side="right")
+        self._button(actions, "Delete", delete_note, kind="danger", width=96).pack(side="right", padx=8)
 
-        # Reminders tab
-        reminders_tab = ttk.Frame(tabs, padding=10)
-        tabs.add(reminders_tab, text="Reminders")
-        reminder_tree = ttk.Treeview(
-            reminders_tab,
-            columns=("title", "due", "status"),
-            show="headings",
-            selectmode="browse",
-            height=11,
-        )
-        reminder_tree.heading("title", text="Reminder")
-        reminder_tree.heading("due", text="Due (local time)")
-        reminder_tree.heading("status", text="Status")
-        reminder_tree.column("title", width=370)
-        reminder_tree.column("due", width=160, stretch=False)
-        reminder_tree.column("status", width=100, stretch=False)
-        reminder_tree.pack(fill="both", expand=True)
-
-        reminder_form = ttk.Frame(reminders_tab)
-        reminder_form.pack(fill="x", pady=(12, 0))
-        reminder_title = tk.StringVar()
+        # ---- Reminders ----
+        form = ctk.CTkFrame(reminders_tab, fg_color=SURFACE, corner_radius=14)
+        form.pack(fill="x", pady=(8, 0))
+        reminder_title = self._entry(form, "Remind me to…")
+        reminder_title.pack(side="left", fill="x", expand=True, padx=(12, 6), pady=12)
+        reminder_due = self._entry(form, "YYYY-MM-DD HH:MM", width=170)
         default_due = (datetime.now() + timedelta(hours=1)).replace(second=0, microsecond=0)
-        reminder_due = tk.StringVar(value=default_due.strftime("%Y-%m-%d %H:%M"))
-        ttk.Label(reminder_form, text="Reminder").grid(row=0, column=0, sticky="w", padx=(0, 8))
-        ttk.Entry(reminder_form, textvariable=reminder_title).grid(row=0, column=1, sticky="ew", padx=(0, 12))
-        ttk.Label(reminder_form, text="Date & time").grid(row=0, column=2, sticky="w", padx=(0, 8))
-        ttk.Entry(reminder_form, textvariable=reminder_due, width=19).grid(row=0, column=3, sticky="ew")
-        ttk.Label(
+        reminder_due.insert(0, default_due.strftime("%Y-%m-%d %H:%M"))
+        reminder_due.pack(side="left", padx=6, pady=12)
+        ctk.CTkLabel(
             reminders_tab,
-            text="Enter date/time as YYYY-MM-DD HH:MM (24-hour clock). Nova must be running to show reminders.",
-            style="Muted.TLabel",
-        ).pack(anchor="w", pady=(5, 0))
-        reminder_form.columnconfigure(1, weight=1)
+            text="Time uses the 24-hour clock. You can also type “remind me to call home in 20 minutes” in a chat.",
+            font=f.ui(12), text_color=SUBTLE, anchor="w",
+        ).pack(fill="x", padx=4, pady=(6, 4))
+        reminder_list = self._scroll_list(reminders_tab)
+        reminder_list.pack(fill="both", expand=True, pady=(4, 0))
+
+        status_style = {
+            "Pending": ("#3a3220", WARNING),
+            "Notified": (ACCENT_SOFT, ACCENT),
+            "Done": ("#1d3326", SUCCESS),
+        }
 
         def refresh_reminders():
-            reminder_tree.delete(*reminder_tree.get_children())
-            for row in list_reminders_db(include_completed=True):
-                status = "Completed" if int(row[3]) else ("Notified" if row[5] else "Pending")
-                reminder_tree.insert("", "end", iid=str(row[0]), values=(row[1], row[2], status))
+            for child in reminder_list.winfo_children():
+                child.destroy()
+            rows = list_reminders_db(include_completed=True)
+            if not rows:
+                self._empty_state(reminder_list, Icon.CLOCK, "No reminders",
+                                  "Add one above. Nova shows a pop-up when it's due.")
+                return
+            for row in rows:
+                reminder_id, title, due_at, completed, notified = row[0], row[1], row[2], int(row[3]), row[5]
+                status = "Done" if completed else ("Notified" if notified else "Pending")
+                card = ctk.CTkFrame(reminder_list, fg_color=SURFACE, corner_radius=12)
+                card.pack(fill="x", pady=3, padx=(0, 8))
+                ctk.CTkLabel(card, text=Icon.CHECK if completed else Icon.CLOCK, font=f.icon(16),
+                             text_color=SUCCESS if completed else MUTED, width=24).pack(side="left", padx=(16, 10), pady=12)
+                text_box = ctk.CTkFrame(card, fg_color="transparent")
+                text_box.pack(side="left", fill="x", expand=True, pady=8)
+                ctk.CTkLabel(text_box, text=title, font=f.ui(14, semibold=True),
+                             text_color=SUBTLE if completed else TEXT, anchor="w").pack(fill="x")
+                ctk.CTkLabel(text_box, text=f"Due {due_at}", font=f.ui(12), text_color=MUTED, anchor="w").pack(fill="x")
+                remove = icon_button(card, f, Icon.DELETE, lambda rid=reminder_id: delete_reminder(rid),
+                                     size=30, icon_size=12, hover=DANGER_SOFT, text_color=SUBTLE)
+                remove.pack(side="right", padx=(2, 12))
+                Tooltip(remove, "Delete reminder", f)
+                if not completed:
+                    done = icon_button(card, f, Icon.CHECK, lambda rid=reminder_id: complete_reminder(rid),
+                                       size=30, icon_size=13, text_color=SUBTLE)
+                    done.pack(side="right", padx=2)
+                    Tooltip(done, "Mark as done", f)
+                chip_fg, chip_text = status_style[status]
+                self._chip(card, status, chip_fg, chip_text).pack(side="right", padx=8)
 
-        def add_reminder():
+        def add_reminder(_event=None):
             title = reminder_title.get().strip()
             due_text = reminder_due.get().strip()
             if not title:
-                messagebox.showwarning("Reminders", "Enter a reminder.", parent=win)
+                reminder_title.focus_set()
                 return
             try:
                 due_dt = datetime.strptime(due_text, "%Y-%m-%d %H:%M")
             except ValueError:
-                messagebox.showwarning(
-                    "Reminders", "Use YYYY-MM-DD HH:MM, for example 2026-11-02 09:30.", parent=win
-                )
+                messagebox.showwarning("Reminders", "Use YYYY-MM-DD HH:MM, for example 2026-11-07 09:30.", parent=win)
                 return
             if due_dt <= datetime.now():
                 messagebox.showwarning("Reminders", "Choose a future date and time.", parent=win)
                 return
             try:
                 save_reminder_db(title, due_dt.strftime("%Y-%m-%d %H:%M"))
-                reminder_title.set("")
+                reminder_title.delete(0, "end")
                 refresh_reminders()
-                self.set_status("Reminder saved locally")
+                self.set_status("Reminder saved")
             except Exception as exc:
                 messagebox.showerror("Reminders", str(exc), parent=win)
 
-        def complete_reminder():
-            selection = reminder_tree.selection()
-            if not selection:
-                messagebox.showinfo("Reminders", "Select a reminder first.", parent=win)
-                return
+        def complete_reminder(reminder_id):
             try:
-                complete_reminder_db(int(selection[0]))
+                complete_reminder_db(reminder_id)
                 refresh_reminders()
-                self.set_status("Reminder marked complete")
+                self.set_status("Reminder marked done")
             except Exception as exc:
                 messagebox.showerror("Reminders", str(exc), parent=win)
 
-        def delete_reminder():
-            selection = reminder_tree.selection()
-            if not selection:
-                messagebox.showinfo("Reminders", "Select a reminder first.", parent=win)
-                return
+        def delete_reminder(reminder_id):
             if not messagebox.askyesno("Delete reminder", "Permanently delete this reminder?", parent=win):
                 return
             try:
-                delete_reminder_db(int(selection[0]))
+                delete_reminder_db(reminder_id)
                 refresh_reminders()
                 self.set_status("Reminder deleted")
             except Exception as exc:
                 messagebox.showerror("Reminders", str(exc), parent=win)
 
-        reminder_buttons = ttk.Frame(reminders_tab)
-        reminder_buttons.pack(fill="x", pady=(9, 0))
-        ttk.Button(reminder_buttons, text="Add reminder", command=add_reminder).pack(side="left")
-        ttk.Button(reminder_buttons, text="Mark complete", command=complete_reminder).pack(side="left", padx=6)
-        ttk.Button(reminder_buttons, text="Delete selected", command=delete_reminder).pack(side="left")
+        self._button(form, "Add", add_reminder, width=80).pack(side="right", padx=(6, 12), pady=12)
+        reminder_title.bind("<Return>", add_reminder)
+        reminder_due.bind("<Return>", add_reminder)
         refresh_notes()
         refresh_reminders()
 
+    # -------------------- tray --------------------
     def start_tray_icon(self):
         if not self.tray_dependencies or self.tray_icon is not None:
             return
-        pystray, Image, ImageDraw = self.tray_dependencies
-        image = Image.new("RGBA", (64, 64), (16, 20, 28, 255))
-        draw = ImageDraw.Draw(image)
-        draw.rounded_rectangle((4, 4, 60, 60), radius=15, fill=(117, 167, 255, 255))
-        draw.ellipse((17, 17, 47, 47), fill=(16, 20, 28, 255))
-        draw.ellipse((24, 24, 40, 40), fill=(157, 226, 195, 255))
+        pystray, _Image, _ImageDraw = self.tray_dependencies
+        image = nova_icon_image(64)
 
         def open_window(icon, item):
             self.root.after(0, self.show_window)
@@ -1768,7 +2002,7 @@ class NovaGUI:
             pystray.MenuItem("Hide to tray", hide_window),
             pystray.MenuItem("Exit Nova", exit_app),
         )
-        self.tray_icon = pystray.Icon("NovaAI", image, "Nova AI", menu)
+        self.tray_icon = pystray.Icon("NovaAI", image, "Nova", menu)
         self.tray_thread = threading.Thread(target=self.tray_icon.run, daemon=True, name="NovaTray")
         self.tray_thread.start()
 
@@ -1791,52 +2025,65 @@ class NovaGUI:
         except tk.TclError:
             pass
 
+    # -------------------- Settings --------------------
     def open_startup_settings(self):
-        win = tk.Toplevel(self.root)
-        win.title("Nova — Startup & tray settings")
-        win.geometry("590x400")
-        win.resizable(False, False)
-        win.transient(self.root)
-        frame = ttk.Frame(win, padding=18)
-        frame.pack(fill="both", expand=True)
-        ttk.Label(frame, text="Startup & background operation", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(
-            frame,
-            text="Configure Nova to start with your Windows account and remain available from the system tray.",
-            style="Muted.TLabel",
-            wraplength=535,
-        ).pack(anchor="w", pady=(5, 14))
+        f = self.fonts
+        win = self._dialog("Settings", "580x500", resizable=False)
+        body = ctk.CTkFrame(win, fg_color=BG)
+        body.pack(fill="both", expand=True, padx=26, pady=22)
+        self._dialog_header(body, "Settings", "Choose how Nova runs in the background.")
 
         startup_var = tk.BooleanVar(value=startup_enabled())
         tray_var = tk.BooleanVar(value=bool(self.settings.get("minimize_to_tray", True)))
-        ttk.Checkbutton(
-            frame,
-            text="Start Nova automatically when I sign in to Windows",
-            variable=startup_var,
-        ).pack(anchor="w", pady=(0, 10))
-
         tray_available = bool(self.tray_dependencies)
-        tray_check = ttk.Checkbutton(
-            frame,
-            text="Keep Nova running in the system tray when I close its window",
-            variable=tray_var,
-        )
-        tray_check.pack(anchor="w", pady=(0, 5))
-        if not tray_available:
-            tray_check.configure(state="disabled")
-            ttk.Label(
-                frame,
-                text="System tray support is not installed. In your activated .venv, run:\npip install pystray pillow\nThen restart Nova.",
-                style="Muted.TLabel",
-                wraplength=530,
-            ).pack(anchor="w", pady=(0, 10))
 
-        ttk.Label(
-            frame,
-            text="When hidden, Nova remains running and can continue checking reminders. Use the tray menu to reopen or exit. Startup applies to the current Windows user only.",
-            style="Muted.TLabel",
-            wraplength=530,
-        ).pack(anchor="w", pady=(10, 14))
+        card = ctk.CTkFrame(body, fg_color=SURFACE, corner_radius=14)
+        card.pack(fill="x")
+
+        def setting_row(parent, title, description, variable, enabled=True, last=False):
+            row = ctk.CTkFrame(parent, fg_color="transparent")
+            row.pack(fill="x", padx=18, pady=(16, 16 if last else 12))
+            text = ctk.CTkFrame(row, fg_color="transparent")
+            text.pack(side="left", fill="x", expand=True)
+            ctk.CTkLabel(text, text=title, font=f.ui(14, semibold=True), text_color=TEXT, anchor="w").pack(fill="x")
+            ctk.CTkLabel(text, text=description, font=f.ui(12), text_color=MUTED, anchor="w",
+                         justify="left", wraplength=400).pack(fill="x", pady=(2, 0))
+            # A disabled switch shows "off" via a throwaway variable, so the
+            # saved setting isn't changed just because the feature is unavailable.
+            shown = variable if enabled else tk.BooleanVar(value=False)
+            switch = ctk.CTkSwitch(
+                row, text="", variable=shown, onvalue=True, offvalue=False, width=46,
+                progress_color=ACCENT if enabled else SURFACE_2, fg_color=SURFACE_2,
+                button_color=TEXT if enabled else SUBTLE,
+                button_hover_color="#ffffff", switch_width=40, switch_height=22,
+                state="normal" if enabled else "disabled",
+            )
+            switch.pack(side="right")
+            return switch
+
+        setting_row(card, "Start with Windows",
+                    "Open Nova automatically when you sign in. Applies to your Windows account only.",
+                    startup_var)
+        ctk.CTkFrame(card, height=1, fg_color=BORDER).pack(fill="x", padx=18)
+        tray_description = (
+            "Closing the window hides Nova in the system tray, so reminders keep working."
+            if tray_available else
+            "Unavailable: run “pip install pystray pillow” in Nova's virtual environment, then restart Nova."
+        )
+        setting_row(card, "Keep running in the tray", tray_description, tray_var,
+                    enabled=tray_available, last=True)
+
+        about = ctk.CTkFrame(body, fg_color=SURFACE, corner_radius=14)
+        about.pack(fill="x", pady=(14, 0))
+        for label, value in (
+            ("Model", MODEL),
+            ("Speech", "whisper.cpp · Vosk wake word"),
+            ("Data", "nova_memory.db on this PC"),
+        ):
+            line = ctk.CTkFrame(about, fg_color="transparent")
+            line.pack(fill="x", padx=18, pady=(8 if label == "Model" else 2, 8 if label == "Data" else 2))
+            ctk.CTkLabel(line, text=label, font=f.ui(13), text_color=MUTED, width=70, anchor="w").pack(side="left")
+            ctk.CTkLabel(line, text=value, font=f.ui(13), text_color=TEXT, anchor="w").pack(side="left")
 
         def apply_settings():
             try:
@@ -1847,16 +2094,17 @@ class NovaGUI:
                     raise RuntimeError(f"Could not save settings to {SETTINGS_PATH}")
                 if tray_var.get() and tray_available and self.tray_icon is None:
                     self.start_tray_icon()
-                messagebox.showinfo("Nova settings", "Settings saved.", parent=win)
+                self.set_status("Settings saved")
                 win.destroy()
             except Exception as exc:
-                messagebox.showerror("Nova settings", str(exc), parent=win)
+                messagebox.showerror("Settings", str(exc), parent=win)
 
-        buttons = ttk.Frame(frame)
+        buttons = ctk.CTkFrame(body, fg_color="transparent")
         buttons.pack(side="bottom", fill="x")
-        ttk.Button(buttons, text="Save settings", command=apply_settings).pack(side="left")
-        ttk.Button(buttons, text="Close", command=win.destroy).pack(side="left", padx=8)
+        self._button(buttons, "Save", apply_settings, width=100).pack(side="right")
+        self._button(buttons, "Cancel", win.destroy, kind="secondary", width=100).pack(side="right", padx=8)
 
+    # -------------------- exit --------------------
     def exit_application(self):
         if self._exiting:
             return
@@ -1884,10 +2132,11 @@ class NovaGUI:
 
 
 def main():
+    ctk.set_appearance_mode("dark")
     initialize_database()
     initialize_productivity_tables()
-    root = tk.Tk()
-    app = NovaGUI(root)
+    root = ctk.CTk()
+    NovaGUI(root)
     root.mainloop()
 
 

@@ -4,6 +4,9 @@
 # Local LLM client (talks to the Ollama app on this PC)
 ollama==0.6.3
 
+# Modern desktop interface (rounded widgets, sharp text on high-DPI screens)
+customtkinter==6.0.0
+
 # Microphone capture and audio processing
 numpy==2.2.6
 scipy==1.15.3

@@ -166,7 +166,10 @@ def save_message(session_id, role, content):
             ).fetchone()["n"]
 
             if count == 1:
-                title = content.replace("\n", " ").strip()[:60]
+                title = " ".join(content.split())
+                if len(title) > 60:
+                    # Cut at a word boundary rather than mid-word.
+                    title = title[:59].rsplit(" ", 1)[0].rstrip(" ,.;:") + "…"
                 conn.execute(
                     "UPDATE sessions SET title = ? WHERE id = ?",
                     (title or "New conversation", session_id),
@@ -228,6 +231,26 @@ def show_history(session_id):
     for row in rows:
         print(f"\n[{row['created_at']}] {row['role'].title()}:")
         print(row["content"])
+
+
+def delete_session(session_id):
+    """Permanently delete a conversation and all its messages.
+
+    Returns True if the conversation existed.
+    """
+    with connect_db() as conn:
+        # Delete messages explicitly rather than relying on ON DELETE CASCADE,
+        # in case the database was created without the foreign key.
+        conn.execute(
+            "DELETE FROM messages WHERE session_id = ?",
+            (session_id,),
+        )
+        cursor = conn.execute(
+            "DELETE FROM sessions WHERE id = ?",
+            (session_id,),
+        )
+
+    return cursor.rowcount > 0
 
 
 def clear_session(session_id):

@@ -60,6 +60,7 @@ When you're done, the folder should look like this:
 nova/
 ├── assistant.py
 ├── nova_gui.py
+├── nova_widgets.py
 ├── record_audio.py
 ├── requirements.txt
 ├── vosk-model-small-en-us-0.15/
@@ -97,12 +98,14 @@ python assistant.py
 
 ## Using the desktop app
 
-- **Type** a message and press Enter to send (Shift+Enter for a new line).
-- **🎙 Voice**: speak after the microphone opens. Recording stops when you pause, and you confirm the transcript before it's sent. Nova speaks its reply.
-- **Hey Nova: ON** listens continuously for the wake phrase, then records your command. While it's on, the Voice button is disabled because both need the microphone.
-- **Manage memories**: save facts about yourself (for example "preference: I prefer short answers"). Only memories you add are stored.
+- **Type** a message and press Enter to send (Shift+Enter for a new line). Nova's replies are formatted (lists, bold, code blocks) and can be selected and copied; right-click a message of yours to copy it.
+- **Conversations** are listed on the left, grouped by date. **New chat** starts one. To delete a chat, hover over it and click the trash icon, or right-click it. Deleting asks for confirmation and can't be undone.
+- **Microphone button**: speak after the microphone opens. Recording stops when you pause, and you confirm the transcript before it's sent. Nova speaks its reply.
+- **Hey Nova switch** listens continuously for the wake phrase, then records your command. While it's on, the microphone button is disabled because both need the microphone.
+- **Memories**: save facts about yourself (for example category "preference", "I prefer short answers"). Only memories you add are stored.
 - **Notes & reminders**: create, edit and delete notes, and schedule reminders. Reminders only pop up while Nova is running, so use the tray option below.
-- **Startup & tray settings**: start Nova when you sign in to Windows, and keep it running in the system tray when you close the window.
+- **Settings**: start Nova when you sign in to Windows, and keep it running in the system tray when you close the window.
+- The status pill in the top-right shows what Nova is doing: green when ready, amber while working or listening, red on errors.
 
 ### Commands
 
