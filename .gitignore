@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Personal data: chats, memories, notes, reminders
+nova_memory.db
+nova_memory.db-*
+*.db-wal
+*.db-shm
+
+# Per-machine settings written by the app (defaults are built in)
+nova_settings.json
+
+# Speech models and binaries (large, downloaded separately)
+whisper/
+models/
+vosk-model-*/
+
+# Audio recordings (may contain your voice)
+*.wav
+
+# Editor / OS
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
