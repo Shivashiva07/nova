@@ -26,6 +26,7 @@ CODE_BG = "#111215"
 CODE_HEAD = "#1a1b1f"
 INLINE_CODE_FG = "#f2b880"
 SELECTION = "#3a4683"
+FOUND_TERM_BG = "#6b5a17"  # search-term highlight (amber, distinct from selection)
 SUCCESS = "#4ade80"
 WARNING = "#fbbf24"
 DANGER = "#f87171"
@@ -36,6 +37,18 @@ CHAT_MAX_WIDTH = 780      # reading column width in the chat view
 
 class Icon:
     """Segoe Fluent Icons / Segoe MDL2 Assets code points."""
+    SEARCH = ""
+    DOCUMENT = ""
+    FOLDER = ""
+    REFRESH = ""
+    CLOSE = ""
+    PIN = ""
+    UNPIN = ""
+    EDIT = ""
+    VIEW = ""
+    HIDE = ""
+    TASKS = ""
+    STOP = ""
     ADD = ""
     DELETE = ""
     SETTINGS = ""
@@ -264,18 +277,18 @@ class StatusPill(ctk.CTkFrame):
 
 # -------------------- Conversation list --------------------
 class _SessionRow(ctk.CTkFrame):
+    """One sidebar chat. The delete button is only created when first needed
+    (hover or selection): most rows never need it, and widgets are costly."""
+
     def __init__(self, owner, master, fonts, session_id, title):
         super().__init__(master, fg_color="transparent", corner_radius=9, height=36)
-        self.owner, self.session_id, self.selected = owner, session_id, False
+        self.owner, self.session_id, self.selected, self.fonts = owner, session_id, False, fonts
         self.pack_propagate(False)
-        font = fonts.ui(14)
-        self.label = ctk.CTkLabel(self, text=fit_text(title, font, 188), font=font, text_color=MUTED, anchor="w")
+        self.title = None
+        self.label = ctk.CTkLabel(self, text="", font=fonts.ui(14), text_color=MUTED, anchor="w")
         self.label.pack(side="left", fill="x", expand=True, padx=(12, 0))
-        self.delete_button = icon_button(
-            self, fonts, Icon.DELETE, lambda: owner.on_delete(session_id),
-            size=26, icon_size=12, hover=DANGER_SOFT, text_color=SUBTLE,
-        )
-        Tooltip(self.delete_button, "Delete chat", fonts)
+        self.set_title(title)
+        self.delete_button = None
         # Bind the row and its label only (not the delete button, whose click
         # must not also select the chat). CTk's bind() covers each widget's internals.
         for widget in (self, self.label):
@@ -283,33 +296,60 @@ class _SessionRow(ctk.CTkFrame):
             widget.bind("<Leave>", self._leave, add="+")
             widget.bind("<Button-1>", lambda _e: owner.on_select(session_id), add="+")
             widget.bind("<Button-3>", lambda e: owner.show_menu(e, session_id), add="+")
-        self.delete_button.bind("<Leave>", self._leave, add="+")
         set_cursor(self)
+
+    def set_title(self, title):
+        if title != self.title:
+            self.title = title
+            self.label.configure(text=fit_text(title, self.owner.row_font, 188))
+
+    def _show_delete(self):
+        if self.delete_button is None:
+            self.delete_button = icon_button(
+                self, self.fonts, Icon.DELETE, lambda: self.owner.on_delete(self.session_id),
+                size=26, icon_size=12, hover=DANGER_SOFT, text_color=SUBTLE,
+            )
+            Tooltip(self.delete_button, "Delete chat", self.fonts)
+            self.delete_button.bind("<Leave>", self._leave, add="+")
+        self.delete_button.pack(side="right", padx=(2, 5), before=self.label)
+
+    def _hide_delete(self):
+        if self.delete_button is not None:
+            self.delete_button.pack_forget()
 
     def _enter(self, _event=None):
         if not self.selected:
             self.configure(fg_color=SURFACE)
-        self.delete_button.pack(side="right", padx=(2, 5), before=self.label)
+        self._show_delete()
 
     def _leave(self, _event=None):
         if pointer_inside(self):
             return
         if not self.selected:
             self.configure(fg_color="transparent")
-            self.delete_button.pack_forget()
+            self._hide_delete()
 
     def set_selected(self, selected):
+        if selected == self.selected:
+            return
         self.selected = selected
         self.configure(fg_color=SURFACE_2 if selected else "transparent")
         self.label.configure(text_color=TEXT if selected else MUTED)
         if selected:
-            self.delete_button.pack(side="right", padx=(2, 5), before=self.label)
+            self._show_delete()
         else:
-            self.delete_button.pack_forget()
+            self._hide_delete()
 
 
 class SessionList(ctk.CTkScrollableFrame):
-    """Sidebar conversation list grouped by date (Today, Yesterday, …)."""
+    """Sidebar conversation list grouped by date (Today, Yesterday, …).
+
+    Rows are reused between refreshes (only new chats get new widgets, only
+    changed titles are redrawn) and chats are shown PAGE at a time, so the
+    list stays quick with hundreds of conversations.
+    """
+
+    PAGE = 60
 
     def __init__(self, master, fonts, on_select, on_delete, **kwargs):
         super().__init__(
@@ -317,27 +357,66 @@ class SessionList(ctk.CTkScrollableFrame):
             scrollbar_button_color=SIDEBAR, scrollbar_button_hover_color=SURFACE_2, **kwargs,
         )
         self.fonts, self.on_select, self.on_delete = fonts, on_select, on_delete
+        self.on_menu = None                          # on_menu(menu, session_id) adds right-click entries
+        self.row_font = fonts.ui(14)
         self.rows = {}
+        self.headers = {}
+        self.limit = self.PAGE
+        self._sessions, self._selected, self._layout = [], None, None
+        self.more = None
         self.menu = tk.Menu(self, tearoff=False)
         autohide_scrollbar(self)
 
     def set_sessions(self, sessions, selected=None):
-        for child in self.winfo_children():
-            child.destroy()
-        self.rows = {}
-        group = None
-        for session_id, title, stamp in sessions:
-            this_group = date_group(stamp)
-            if this_group != group:
-                group = this_group
-                ctk.CTkLabel(
-                    self, text=group, font=self.fonts.ui(12, semibold=True),
-                    text_color=SUBTLE, anchor="w",
-                ).pack(fill="x", padx=12, pady=(14 if self.rows else 4, 4))
-            row = _SessionRow(self, self, self.fonts, session_id, title)
-            row.pack(fill="x", padx=(4, 6), pady=1)
-            self.rows[session_id] = row
+        self._sessions, self._selected = list(sessions), selected
+        ids = [s[0] for s in self._sessions]
+        if selected in ids and ids.index(selected) >= self.limit:
+            self.limit = (ids.index(selected) // self.PAGE + 1) * self.PAGE   # keep the open chat visible
+        visible = self._sessions[:self.limit]
+        wanted = {s[0] for s in visible}
+        for session_id in [sid for sid in self.rows if sid not in wanted]:
+            self.rows.pop(session_id).destroy()
+        layout = []
+        for session_id, title, stamp in visible:
+            row = self.rows.get(session_id)
+            if row is None:
+                row = self.rows[session_id] = _SessionRow(self, self, self.fonts, session_id, title)
+            else:
+                row.set_title(title)
+            layout.append((date_group(stamp), session_id))
+        hidden = len(self._sessions) - len(visible)
+        if (layout, hidden) != self._layout:   # re-pack only when order, groups or paging changed
+            self._repack(layout, hidden)
+            self._layout = (layout, hidden)
         self.set_selected(selected)
+
+    def _repack(self, layout, hidden):
+        for child in self.winfo_children():
+            child.pack_forget()
+        groups = {group for group, _sid in layout}
+        for name in [g for g in self.headers if g not in groups]:
+            self.headers.pop(name).destroy()
+        current = None
+        for index, (group, session_id) in enumerate(layout):
+            if group != current:
+                current = group
+                header = self.headers.get(group)
+                if header is None:
+                    header = self.headers[group] = ctk.CTkLabel(
+                        self, text=group, font=self.fonts.ui(12, semibold=True), text_color=SUBTLE, anchor="w")
+                header.pack(fill="x", padx=12, pady=(14 if index else 4, 4))
+            self.rows[session_id].pack(fill="x", padx=(4, 6), pady=1)
+        if hidden > 0:
+            if self.more is None:
+                self.more = ctk.CTkButton(
+                    self, text="", height=30, corner_radius=9, fg_color="transparent", hover_color=SURFACE,
+                    text_color=SUBTLE, font=self.fonts.ui(13), command=self._show_more)
+            self.more.configure(text=f"Show more chats ({hidden})")
+            self.more.pack(fill="x", padx=(4, 6), pady=(8, 4))
+
+    def _show_more(self):
+        self.limit += self.PAGE
+        self.set_sessions(self._sessions, self._selected)
 
     def set_selected(self, session_id):
         for sid, row in self.rows.items():
@@ -345,6 +424,8 @@ class SessionList(ctk.CTkScrollableFrame):
 
     def show_menu(self, event, session_id):
         self.menu.delete(0, "end")
+        if self.on_menu is not None:
+            self.on_menu(self.menu, session_id)    # e.g. "Move to project"
         self.menu.add_command(label="Delete chat", command=lambda: self.on_delete(session_id))
         try:
             self.menu.tk_popup(event.x_root, event.y_root)
@@ -353,8 +434,19 @@ class SessionList(ctk.CTkScrollableFrame):
 
 
 # -------------------- Chat view --------------------
+def open_web_link(url):
+    """Open a clicked http(s) link in the default browser (nothing else is ever opened)."""
+    import webbrowser
+    from urllib.parse import urlsplit
+    if urlsplit(url).scheme in ("http", "https"):
+        webbrowser.open(url)
+
+
 _INLINE = re.compile(
-    r"\*\*\*(?P<bi>.+?)\*\*\*"
+    # Plain web addresses become clickable, always showing the full address. [text](url)
+    # links aren't rendered, so a web page can't disguise where a link goes.
+    r"(?P<url>https?://(?:[^\s<>()\[\]\"'`]|\([^\s<>()\[\]\"'`]*\))+(?<![.,;:!?*]))"
+    r"|\*\*\*(?P<bi>.+?)\*\*\*"
     r"|\*\*(?P<b>.+?)\*\*"
     r"|`(?P<code>[^`\n]+)`"
     r"|(?<![\w*])\*(?P<i>[^*\s](?:[^*\n]*[^*\s])?)\*(?![\w*])"
@@ -384,6 +476,12 @@ class ChatView(ctk.CTkFrame):
         self._streaming = False
         self._column_width = CHAT_MAX_WIDTH
         self._scroll_needed = False
+        self._message_marks = []   # text marks at the start of each loaded message
+        self._flash_job = None
+        self._flashed = []         # user bubbles currently highlighted
+        self._actions = []         # embedded buttons ("Show earlier messages")
+        self._links = 0            # clickable "what Nova used" lines (tags context_link_N)
+        self._bulk = False         # loading many messages: scroll once at the end
 
         self.text = tk.Text(
             self, wrap="word", bg=BG, fg=TEXT, relief="flat", borderwidth=0,
@@ -474,6 +572,15 @@ class ChatView(ctk.CTkFrame):
         t.tag_configure("welcome_title", font=(f.display, -30), foreground=TEXT, justify="center", spacing1=110, spacing3=8)
         t.tag_configure("welcome_sub", font=f.tk(15), foreground=MUTED, justify="center", spacing3=26)
         t.tag_configure("center", justify="center", spacing1=4, spacing3=4)
+        # "Used 2 memories · 1 note" under an answer: opens what Nova used.
+        t.tag_configure("context_link", font=f.tk(12), foreground=SUBTLE, lmargin1=2, spacing1=2, spacing3=4)
+        t.tag_configure("context_link_hover", foreground=ACCENT, underline=True)
+        t.tag_configure("url", foreground=ACCENT, underline=True)
+        # Search: the opened message is briefly tinted; matching words stay marked.
+        t.tag_configure("found", background=ACCENT_SOFT)
+        t.tag_configure("found_term", background=FOUND_TERM_BG, foreground="#ffffff")
+        t.tag_raise("found_term")
+        t.tag_raise("sel")
 
     # ---- editing helpers ----
     def _edit(self):
@@ -481,8 +588,15 @@ class ChatView(ctk.CTkFrame):
 
     def _done(self, follow):
         self.text.configure(state="disabled")
-        if follow:
+        if follow and not self._bulk:
             self.text.see("end")
+
+    # ---- bulk loading (one scroll at the end instead of one per message) ----
+    def begin_bulk(self):
+        self._bulk = True
+
+    def end_bulk(self):
+        self._bulk = False
 
     def _at_bottom(self):
         return self.text.yview()[1] >= 0.995
@@ -497,12 +611,127 @@ class ChatView(ctk.CTkFrame):
         for label in self.bubbles:
             label.master.destroy()
         self.bubbles = []
+        for button in self._actions:
+            button.destroy()
+        self._actions = []
+        for mark in self._message_marks:
+            self.text.mark_unset(mark)
+        self._message_marks = []
+        for tag in self.text.tag_names():
+            if tag.startswith(("context_link_", "url_")):
+                self.text.tag_delete(tag)        # also drops its click bindings
+        self._flashed = []
         self.welcome_visible = False
         self._streaming = False
         self._done(False)
 
     def scroll_to_end(self):
         self.text.see("end")
+
+    def add_link(self, text, command):
+        """A small clickable line under the latest answer (no widget: a text tag)."""
+        self._clear_welcome()
+        follow = not self._bulk and self._at_bottom()
+        self._edit()
+        self._links += 1
+        tag = f"context_link_{self._links}"
+        self.text.insert("end", "ⓘ  " + text + "\n", ("context_link", tag))
+        self.text.tag_bind(tag, "<Button-1>", lambda _e: command())
+        self.text.tag_bind(tag, "<Enter>", lambda _e, t=tag: (self.text.tag_add("context_link_hover", f"{t}.first",
+                                                                               f"{t}.last"),
+                                                              self.text.configure(cursor="hand2")))
+        self.text.tag_bind(tag, "<Leave>", lambda _e: (self.text.tag_remove("context_link_hover", "1.0", "end"),
+                                                      self.text.configure(cursor="")))
+        self._done(follow)
+
+    def add_action(self, text, command):
+        """A centred button line, e.g. "Show earlier messages"."""
+        self._clear_welcome()
+        self._edit()
+        button = ctk.CTkButton(
+            self.text, text=text, font=self.fonts.ui(12), height=28, corner_radius=14, fg_color=SURFACE,
+            hover_color=SURFACE_2, border_width=1, border_color=BORDER, text_color=MUTED, bg_color=BG,
+            command=command,
+        )
+        bind_tree(button, "<MouseWheel>", self._wheel)
+        self._actions.append(button)
+        start = self.text.index("end-1c")
+        self.text.window_create("end", window=button, padx=4, pady=6)
+        self.text.insert("end", "\n")
+        self.text.tag_add("center", start, "end-1c")
+        self._done(False)
+
+    # ---- locating messages (used by search) ----
+    def mark_message(self, key):
+        """Remember where the next added message starts, under a name like 'msg_42'."""
+        self.text.mark_set(key, "end-1c")
+        self.text.mark_gravity(key, "left")
+        self._message_marks.append(key)
+
+    def reveal_message(self, key, terms=(), flash_ms=2600):
+        """Scroll a marked message to the top, tint it briefly and mark the search terms.
+
+        Returns False if the message isn't in the current view.
+        """
+        if key not in self._message_marks:
+            return False
+        t = self.text
+        position = self._message_marks.index(key)
+        start = t.index(key)
+        end = (t.index(self._message_marks[position + 1])
+               if position + 1 < len(self._message_marks) else t.index("end-1c"))
+        self._end_flash()
+        t.tag_remove("found_term", "1.0", "end")
+        t.tag_add("found", start, end)
+        # Search the rendered text (Markdown markers already removed).
+        count = tk.IntVar(self)
+        for term in terms:
+            index = start
+            while True:
+                hit = t.search(term, index, stopindex=end, nocase=True, count=count)
+                if not hit or count.get() == 0:
+                    break
+                hit_end = f"{hit}+{count.get()}c"
+                t.tag_add("found_term", hit, hit_end)
+                index = hit_end
+        # User messages are embedded bubbles, so tint the bubble itself.
+        for _kind, name, _index in t.dump(start, end, window=True):
+            try:
+                holder = self.nametowidget(name)
+                holder.configure(fg_color=ACCENT_SOFT, border_width=1, border_color=ACCENT)
+                self._flashed.append(holder)
+            except (KeyError, tk.TclError, ValueError):
+                pass
+
+        def scroll():
+            try:
+                t.update_idletasks()
+                t.yview(start)
+            except tk.TclError:
+                pass
+
+        scroll()
+        self.after(150, scroll)  # again once wrapped bubbles have their final height
+        self._flash_job = self.after(flash_ms, self._end_flash)
+        return True
+
+    def _end_flash(self):
+        if self._flash_job:
+            try:
+                self.after_cancel(self._flash_job)
+            except tk.TclError:
+                pass
+            self._flash_job = None
+        try:
+            self.text.tag_remove("found", "1.0", "end")
+        except tk.TclError:
+            return
+        for holder in self._flashed:
+            try:
+                holder.configure(fg_color=USER_BUBBLE, border_width=0)
+            except tk.TclError:
+                pass
+        self._flashed = []
 
     # ---- messages ----
     def show_welcome(self, suggestions):
@@ -556,7 +785,7 @@ class ChatView(ctk.CTkFrame):
 
     def add_assistant(self, content):
         self._clear_welcome()
-        follow = self._at_bottom()
+        follow = not self._bulk and self._at_bottom()
         self._edit()
         self._role_line()
         self._render_markdown(content)
@@ -564,7 +793,7 @@ class ChatView(ctk.CTkFrame):
 
     def add_info(self, content, error=False):
         self._clear_welcome()
-        follow = self._at_bottom()
+        follow = not self._bulk and self._at_bottom()
         self._edit()
         tags = ("info", "error") if error else ("info",)
         self.text.insert("end", (Icon.WARNING if error else Icon.INFO) + "  ", tags + ("info_icon",))
@@ -612,7 +841,15 @@ class ChatView(ctk.CTkFrame):
         for match in _INLINE.finditer(line):
             if match.start() > pos:
                 self.text.insert("end-1c", line[pos:match.start()], base)
-            if match.group("bi") is not None:
+            if match.group("url") is not None:
+                self._links += 1
+                tag = f"url_{self._links}"
+                url = match.group("url")
+                self.text.insert("end-1c", url, base + ("url", tag))
+                self.text.tag_bind(tag, "<Button-1>", lambda _e, u=url: open_web_link(u))
+                self.text.tag_bind(tag, "<Enter>", lambda _e: self.text.configure(cursor="hand2"))
+                self.text.tag_bind(tag, "<Leave>", lambda _e: self.text.configure(cursor=""))
+            elif match.group("bi") is not None:
                 self.text.insert("end-1c", match.group("bi"), base + ("bold_italic",))
             elif match.group("b") is not None:
                 self.text.insert("end-1c", match.group("b"), base + ("bold",))

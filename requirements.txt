@@ -18,6 +18,10 @@ pyttsx3==2.99
 # Offline "Hey Nova" wake word
 vosk==0.3.41
 
+# Document Q&A: reading PDF text (pure Python). Word, Excel, CSV and text files
+# are read with the standard library. Without pypdf, PDFs are reported as needing it.
+pypdf==7.0.0
+
 # Optional: system tray icon (Nova runs without these)
 pystray==0.19.5
 pillow==12.3.0

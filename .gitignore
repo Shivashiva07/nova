@@ -7,11 +7,20 @@ venv/
 # Personal data: chats, memories, notes, reminders
 nova_memory.db
 nova_memory.db-*
+nova_memory.backup-*.db
+nova_memory.backup-*.db-*
+nova_memory.damaged-*.db*
+backups/
+*.novabackup
 *.db-wal
 *.db-shm
 
-# Per-machine settings written by the app (defaults are built in)
+# Per-machine settings written by the app (defaults are built in),
+# copies of unreadable settings files, and the app log
 nova_settings.json
+nova_settings.unreadable-*.json
+nova.log
+nova.log.*
 
 # Speech models and binaries (large, downloaded separately)
 whisper/
@@ -26,3 +35,5 @@ vosk-model-*/
 .idea/
 Thumbs.db
 desktop.ini
+tests/_actions_*/
+tests/_agent_*/
