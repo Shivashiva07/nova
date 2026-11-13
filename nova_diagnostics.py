@@ -158,7 +158,8 @@ def run_checks(db_path, model, backup_folder, log_path, settings_warnings=(), li
                     con.close()
                 labels = {"sessions": "chats", "messages": "messages", "memories": "memories", "nova_notes": "notes",
                           "nova_reminders": "reminders", "doc_files": "documents", "task_runs": "tasks",
-                          "nova_projects": "projects"}
+                          "nova_projects": "projects", "work_entries": "work notes",
+                          "scheduled_jobs": "scheduled tasks"}
                 add("Database", "Contents", INFO, ", ".join(f"{n} {labels[t]}" for t, n in counts.items()))
             except sqlite3.Error as exc:
                 add("Database", "Contents", ERROR, f"Couldn't read: {exc}")

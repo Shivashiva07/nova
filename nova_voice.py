@@ -308,7 +308,10 @@ _FILLERS = {"please", "um", "uh", "er", "hey", "nova", "now", "ok", "okay", "jus
 STOP = {"stop", "stop talking", "stop speaking", "be quiet", "quiet", "shut up", "silence", "enough", "that's enough",
         "thats enough", "stop it", "hush"}
 CANCEL = {"cancel", "cancel that", "cancel it", "cancel the task", "cancel this", "stop the task", "abort",
-          "never mind", "nevermind", "forget it", "stop everything", "stop working"}
+          "never mind", "nevermind", "forget it", "stop working"}
+# Step 34: stop every task at once (the agent, scheduled tasks, typing, Nova's browser), like the red button.
+EMERGENCY = {"emergency stop", "stop everything", "stop all tasks", "stop all", "abort everything",
+             "cancel everything", "cancel all tasks", "halt everything"}
 CONFIRM = {"confirm", "i confirm", "yes confirm", "confirmed", "confirm it", "yes i confirm"}
 YES = {"yes", "yeah", "yep", "yes please", "sure", "go ahead", "do it", "run it", "approve", "approved", "proceed",
        "go", "run", "yes run it", "yes go ahead", "yes do it", "that's right", "correct", "affirmative"} | CONFIRM
@@ -332,7 +335,8 @@ def classify_utterance(text, wake=None):
     said = " ".join(words)
     if not said:
         return ""
-    for kind, phrases in (("stop", STOP), ("cancel", CANCEL), ("confirm", CONFIRM), ("yes", YES), ("no", NO)):
+    for kind, phrases in (("emergency", EMERGENCY), ("stop", STOP), ("cancel", CANCEL), ("confirm", CONFIRM),
+                          ("yes", YES), ("no", NO)):
         if said in phrases:
             return kind
     return None
@@ -770,8 +774,8 @@ class VoiceLoop:
             self.handlers.stop_speaking()
             self._settle()
             return
-        if kind == "cancel":
-            self.handlers.control("cancel")
+        if kind in ("cancel", "emergency"):
+            self.handlers.control(kind)
             self._settle()
             return
         if kind in ("yes", "no", "confirm"):
@@ -804,6 +808,11 @@ class VoiceLoop:
         kind = classify_utterance(text, self.phrase)
         if kind == "stop":
             self.handlers.stop_speaking()
+            return
+        if kind == "emergency":                       # answers “no”, then stops everything
+            self.handlers.approval_answer(approval, False)
+            self.handlers.control("emergency")
+            approval.resolved.wait(2)
             return
         if approval.strong:
             value = True if kind == "confirm" else False if kind in ("no", "cancel") else None

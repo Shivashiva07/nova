@@ -183,6 +183,13 @@ _REDACTIONS = (
     (re.compile(r"(?i)\b(password|passwd|pwd|passphrase|secret|token|api[_-]?key|access[_-]?key|client[_-]?secret)"
                 r"(\s*[:=]\s*|\s+is\s+)(\"[^\"]*\"|'[^']*'|\S+)"), r"\1\2[redacted]"),
     (re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)[^/\s:@]+:[^/\s@]+@"), r"\1[redacted]@"),
+    # Step 34: web tokens, private keys, cookies and secrets in web addresses
+    (re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"), "[redacted token]"),
+    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)", re.S),
+     "[redacted private key]"),
+    (re.compile(r"(?i)\b(cookie|set-cookie|authorization|x-api-key)(\s*[:=]\s*)[^\n]+"), r"\1\2[redacted]"),
+    (re.compile(r"(?i)([?&](?:access_token|token|key|api_key|apikey|sig|signature|code|password|secret)=)[^&\s#]+"),
+     r"\1[redacted]"),
     (re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"), "[email]"),
     (re.compile(r"\b(?:\d[ -]?){13,19}\b"), "[number]"),
 )

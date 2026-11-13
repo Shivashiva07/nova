@@ -23,6 +23,7 @@ from pathlib import Path
 FMT = "%Y-%m-%d %H:%M"
 MAX_AHEAD_DAYS = 2 * 366
 MISSED_GRACE_MINUTES = 2      # an alert this late was missed (Nova closed, PC asleep)
+MIN_INTERVAL = 5              # shortest “every N minutes” repeat (Step 33's scheduled checks)
 MAX_TITLE = 200
 DAY_CODES = ["MO", "TU", "WE", "TH", "FR", "SA", "SU"]
 DAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
@@ -114,10 +115,12 @@ def ceil_minute(moment):
 def validate_rule(rule):
     """Return the rule if it's one Nova supports, else raise ValueError.
 
-    daily | weekly:MO,WE,... | monthly:1..31 | monthly:last
+    daily | weekly:MO,WE,... | monthly:1..31 | monthly:last | every:N (minutes, 5..10080; Step 33's checks)
     """
     kind, _, arg = str(rule).partition(":")
     if kind == "daily" and not arg:
+        return rule
+    if kind == "every" and arg.isdigit() and MIN_INTERVAL <= int(arg) <= 7 * 24 * 60:
         return rule
     if kind == "weekly":
         codes = arg.split(",")
@@ -137,6 +140,10 @@ def next_occurrence(rule, anchor, after):
     """
     hour, minute = (int(x) for x in anchor.split(":"))
     kind, _, arg = validate_rule(rule).partition(":")
+    if kind == "every":            # a steady interval, counted from a fixed origin at the anchor time
+        origin, step = datetime(2000, 1, 1, hour, minute), int(arg)
+        passed = int((after - origin).total_seconds() // 60)
+        return origin + timedelta(minutes=(passed // step + 1) * step)
     if kind == "daily":
         candidate = datetime.combine(after.date(), datetime.min.time()).replace(hour=hour, minute=minute)
         return candidate if candidate > after else candidate + timedelta(days=1)
@@ -166,6 +173,13 @@ def _ordinal(n):
 def describe_rule(rule, anchor):
     kind, _, arg = validate_rule(rule).partition(":")
     at = clock(anchor)
+    if kind == "every":
+        minutes = int(arg)
+        if minutes % 1440 == 0:
+            return f"every {minutes // 1440} days at {at}" if minutes > 1440 else f"every day at {at}"
+        if minutes % 60 == 0:
+            return "every hour" if minutes == 60 else f"every {minutes // 60} hours"
+        return f"every {minutes} minutes"
     if kind == "daily":
         return f"every day at {at}"
     if kind == "weekly":

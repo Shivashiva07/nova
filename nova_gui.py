@@ -21,11 +21,12 @@ import webbrowser
 import json
 import queue
 import threading
+from contextlib import contextmanager
 import subprocess
 import tempfile
 from pathlib import Path
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, simpledialog
 
 def _fatal(message):
     """Show a startup error in a window (pythonw.exe has no console), then exit."""
@@ -80,16 +81,22 @@ from nova_widgets import (
 import nova_actions
 import nova_agent
 import nova_backup
+import nova_browser
+import nova_desktop
 import nova_context
 import nova_diagnostics
 import nova_documents
 import nova_memories
 import nova_online
 import nova_perf
+import nova_policy
+import nova_recall
 import nova_reminders
+import nova_schedule
 import nova_tasks
 import nova_search
 import nova_settings
+import nova_vision
 import nova_voice
 from nova_settings import SETTINGS_PATH, log
 from nova_system import NOVA_VERSION, atomic_write_text, safe_walk
@@ -126,6 +133,9 @@ def apply_runtime_settings(settings, devices=None):
     fall back to a default (e.g. an unplugged microphone).
     """
     notes = []
+    nova_recall.RECALL_IN_CHAT = bool(settings.get("memory_recall_enabled", True))     # Step 32
+    nova_policy.GATE.pause(bool(settings.get("tasks_paused", False)))                  # Step 34
+    nova_policy.GATE.approval_ttl = 60 * int(settings.get("approval_ttl_minutes") or nova_policy.APPROVAL_TTL_MINUTES)
     backend.MODEL = settings.get("ollama_model") or DEFAULT_MODEL
     backend.TTS_VOICE = settings.get("tts_voice")
     backend.TTS_RATE = settings.get("tts_rate") or DEFAULT_TTS_RATE
@@ -916,6 +926,15 @@ def model_capabilities(model):
     return value
 
 
+def installed_models():
+    """Names of the models installed in Ollama ([] if it can't be reached)."""
+    try:
+        return nova_settings.list_ollama_models(timeout=5.0)
+    except Exception as exc:
+        log.info("Couldn't list the installed models: %s", exc)
+        return []
+
+
 def context_budget(model, settings=None):
     """The context budget for a request: the Context size setting, capped by the model."""
     size = settings.get("context_size") if isinstance(settings, dict) else None
@@ -977,10 +996,24 @@ FILE_SEARCH_SKIP_DIRS = {"node_modules", "__pycache__", "venv", "site-packages"}
 # These actions are deliberately limited to opening known apps/locations,
 # opening websites, and searching common user folders. No shell command from
 # the model is ever executed.
-def run_local_action(user_text):
-    """Run a supported local action and return a user-facing result, or None."""
+def run_local_action(user_text, origin="typed"):
+    """Run a supported local action and return a user-facing result, or None.
+
+    Step 34: these direct commands go through the same permission gate as every other tool call (nothing
+    starts while tasks are paused; each is logged), and only start programs from Nova's fixed list."""
     text = user_text.strip()
     low = text.lower().strip().rstrip(".!?")
+    tool = nova_policy.direct_command_tool(low)
+    if tool is not None and nova_policy.GATE.paused:
+        nova_policy.log_decision(get_db_connection, None, None, tool, text, "paused", origin)
+        return "Nova's tasks are paused, so nothing was opened. Resume them from the sidebar or the tray."
+    result = _run_local_action(text, low)
+    if result is not None and tool is not None:
+        nova_policy.log_decision(get_db_connection, None, None, tool, text, "allowed", origin, "your direct command")
+    return result
+
+
+def _run_local_action(text, low):
 
     websites = {
         "youtube": "https://www.youtube.com",
@@ -995,27 +1028,24 @@ def run_local_action(user_text):
             return f"Opened {name.title()} in your default browser."
 
     if re.fullmatch(r"(?:please )?(?:open|launch|start) (?:visual studio code|vs code|vscode)", low):
-        code_cmd = shutil.which("code")
-        candidates = [
-            Path(os.environ.get("LOCALAPPDATA", "")) / "Programs/Microsoft VS Code/Code.exe",
-            Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "Microsoft VS Code/Code.exe",
-        ]
-        executable = Path(code_cmd) if code_cmd else next((p for p in candidates if p.is_file()), None)
-        if executable and executable.is_file():
-            subprocess.Popen([str(executable)], close_fds=True)
+        # Code.exe by full path only: a “code” found on PATH could be any script with that name.
+        executable = find_vscode_exe()
+        if executable:
+            subprocess.Popen(nova_policy.check_launch([str(executable)]), close_fds=True, shell=False)
             return "Opened Visual Studio Code."
-        return "I couldn't find Visual Studio Code. Install it or add its 'code' command to PATH."
+        return "I couldn't find Visual Studio Code (Code.exe)."
 
+    # Task Manager isn't here: it can end processes and change startup apps, so Nova doesn't open it (the same
+    # rule as for tasks and the agent). Open it yourself with Ctrl+Shift+Esc.
     apps = {
         "notepad": ["notepad.exe"],
         "calculator": ["calc.exe"],
         "paint": ["mspaint.exe"],
-        "task manager": ["taskmgr.exe"],
     }
     for name, command in apps.items():
         if re.fullmatch(rf"(?:please )?(?:open|launch|start) (?:the )?{re.escape(name)}", low):
             try:
-                subprocess.Popen(command, close_fds=True)
+                subprocess.Popen(nova_policy.check_launch(command), close_fds=True, shell=False)
                 return f"Opened {name.title()}."
             except Exception as exc:
                 return f"Couldn't open {name.title()}: {exc}"
@@ -1148,7 +1178,7 @@ def task_services():
     home = Path.home()
     return nova_tasks.Services(
         open_url=webbrowser.open,
-        launch=lambda argv: subprocess.Popen(list(argv), close_fds=True, shell=False),
+        launch=lambda argv: subprocess.Popen(nova_policy.check_launch(list(argv)), close_fds=True, shell=False),
         open_folder=os.startfile,
         find_vscode=find_vscode_exe,
         search_files=search_filenames,
@@ -1397,6 +1427,31 @@ class NovaGUI:
         self.agent_registry = nova_agent.default_registry()   # Step 28: tools the agent may use
         self._agent_cancel = None
         self._agent_ui = None
+        # Step 30: desktop and browser automation (the browser starts only when a task first needs it)
+        self.desktop = nova_desktop.WindowsDesktop()
+        self.browser = None
+        self._emergency_hotkey = None
+        # Step 33: scheduled tasks, watches and notifications (one scheduler: the reminder check drives them)
+        self._scheduled_cancels = set()
+        self._app_check_at = 0.0
+        self._automations_ui = None
+        self._note_windows = []
+        self.file_watcher = nova_schedule.FileWatcher(lambda job_id: self.events.put(("file_changed", job_id)))
+        # Step 31: looking at the screen (screenshots stay in memory on this PC; see nova_vision)
+        self._capture_hidden = []
+        self._screen_banner = None
+        self.vision = nova_vision.ScreenAnalyzer(
+            nova_vision.ScreenCapturer(exclusions=lambda: list(self.settings.get("vision_exclusions") or []),
+                                       hide=self._hidden_for_capture),
+            nova_vision.WindowsOcr(),
+            nova_vision.VisionModel(lambda **kw: ollama.chat(**kw), model_capabilities, installed=installed_models,
+                                    active_model=active_model),
+            settings=lambda: self.settings,
+            controls=lambda handle: [c.name for c in self.desktop.controls(handle) if c.name and c.enabled],
+            on_access=lambda kind, source: self.events.put(("screen_access", (kind, source))),
+            audit=lambda source, purpose: nova_agent.record_audit(
+                get_db_connection, None, "screen", f"Looked at {source} ({purpose}); the screenshot wasn't saved",
+                source, "succeeded"))
         self._http = None                               # created on the first online request
         self._summary_cancel = threading.Event()
         self._summarizing = False
@@ -1415,6 +1470,8 @@ class NovaGUI:
         self.set_status("Ready")
         self._settings_warnings = self._settings_warnings_at_start
         self._schedule("events", 100, self.poll_events)
+        self._start_automations()                          # Step 33: before the first scheduler check
+        self._start_global_stop_hotkey()                   # Step 34: Ctrl+Alt+Backspace stops everything
         self._schedule("reminders", 1000, self.poll_due_reminders)
         self._schedule("auto_backup", 15000, self._auto_backup)
         self._schedule("prewarm", 1500, self._prewarm_imports)
@@ -1549,6 +1606,19 @@ class NovaGUI:
         ctk.CTkFrame(sidebar, height=1, fg_color=BORDER, corner_radius=0).pack(fill="x", padx=16, pady=8)
         NavButton(sidebar, f, Icon.DOCUMENT, "Documents", self.open_documents).pack(fill="x", padx=12, pady=1)
         NavButton(sidebar, f, Icon.TASKS, "Tasks", self.open_tasks).pack(fill="x", padx=12, pady=1)
+        NavButton(sidebar, f, Icon.VIEW, "Look at screen", self.open_look_menu).pack(fill="x", padx=12, pady=1)
+        NavButton(sidebar, f, Icon.CLOCK, "Automations", self.open_automations).pack(fill="x", padx=12, pady=1)
+        # Step 34: always-available safety controls
+        stop_nav = NavButton(sidebar, f, Icon.STOP, "Stop everything", lambda: self.stop_everything("button"))
+        stop_nav.pack(fill="x", padx=12, pady=1)
+        Tooltip(stop_nav, "Stops every running task at once (also Ctrl+Alt+Backspace, or say “emergency stop”)", f)
+        pause_var = tk.BooleanVar(value=bool(self.settings.get("tasks_paused", False)))
+        pause_switch = ctk.CTkSwitch(sidebar, text="Pause new tasks", variable=pause_var, onvalue=True, offvalue=False,
+                                     command=lambda: self.set_tasks_paused(bool(pause_var.get())), font=f.ui(12),
+                                     text_color=MUTED, progress_color=DANGER, switch_width=34, switch_height=18)
+        pause_switch.pack(anchor="w", padx=22, pady=(4, 2))
+        Tooltip(pause_switch, "While on, nothing new starts: typed, spoken, agent, task: or scheduled", f)
+        self._safety_controls_refresh = lambda: pause_var.set(nova_policy.GATE.paused)
         NavButton(sidebar, f, Icon.MEMORY, "Memories", self.open_memories).pack(fill="x", padx=12, pady=1)
         NavButton(sidebar, f, Icon.NOTE, "Notes & reminders", self.open_productivity).pack(fill="x", padx=12, pady=1)
         NavButton(sidebar, f, Icon.SETTINGS, "Settings", self.open_startup_settings).pack(fill="x", padx=12, pady=1)
@@ -1885,6 +1955,20 @@ class NovaGUI:
         if project_name is not None:
             self.events.put(("project_command", (project_name, speak)))
             return
+        draft = nova_schedule.parse_command(text)                # "schedule …: …", "watch …" (Step 33)
+        if draft is not None:
+            self._automation_command(session_id, text, draft)
+            return
+        if nova_recall.is_memory_command(text):                  # "decision: …", "don't remember …" (Step 32)
+            self._online_reply(session_id, text, self._memory_command(session_id, text), speak)
+            return
+        if nova_recall.parse_continue(text) is not None and self.settings.get("memory_recall_enabled", True):
+            self._run_agent(session_id, text, text, speak)       # "continue X from yesterday": verified, then resumed
+            return
+        look = nova_vision.parse_command(text)           # "look at my screen" (Step 31)
+        if look is not None:
+            self._look_at_screen(session_id, text, look, speak)
+            return
         agent_request = nova_agent.parse_command(text)   # "agent: …" (Step 28)
         if agent_request is not None:
             self._run_agent(session_id, text, agent_request, speak)
@@ -2110,10 +2194,18 @@ class NovaGUI:
             self._finish_reminder_reply(session_id, text, handled, nova_voice.speakable(handled[0], 300))
             return
         command = nova_voice.command_text(text)                 # without the punctuation whisper adds
+        if nova_recall.is_memory_command(command):                        # Step 32
+            memory_reply = self._memory_command(session_id, command)
+            self._online_reply(session_id, text, memory_reply, nova_voice.speakable(memory_reply, 300))
+            return
+        look = nova_vision.parse_command(command)               # “Nova, look at my screen” (Step 31)
+        if look is not None:
+            self._look_at_screen(session_id, text, look, True)
+            return
         try:
             result = (nova_voice.quick_answer(command)
                       or handle_productivity_command(command, with_db(nova_context.session_project, session_id))
-                      or run_local_action(command))
+                      or run_local_action(command, origin="voice"))
         except Exception as exc:
             result = f"Couldn't complete that: {exc}"
         if result is not None:
@@ -2411,6 +2503,8 @@ class NovaGUI:
                 elif event == "voice_control":
                     if payload == "cancel":
                         self._voice_cancel()
+                    elif payload == "emergency":            # Step 34: “emergency stop” / “stop everything”
+                        self.stop_everything("voice")
                 elif event == "voice_approval":
                     approval, value = payload
                     decide = self._voice_approvals.pop(approval, None)
@@ -2473,6 +2567,32 @@ class NovaGUI:
                     self._agent_event(*payload)
                 elif event == "agent_ask":
                     self._agent_answer(*payload)
+                elif event == "agent_emergency":
+                    self._show_emergency_stop()
+                elif event == "file_changed":               # Step 33
+                    self._on_file_changed(payload)
+                elif event == "automations_changed":
+                    self._automations_changed()
+                elif event == "automation_draft":
+                    self.open_automations()
+                    self._automation_editor(self._automations_window, draft=payload,
+                                            on_saved=self._automations_changed)
+                elif event == "scheduled_attention":
+                    self.show_window()
+                    self.set_status(f"Scheduled task “{payload[0]}” needs your approval")
+                elif event == "screen_access":
+                    self._on_screen_access(*payload)
+                elif event == "capture_hide":
+                    self._capture_hide(payload)
+                elif event == "capture_restore":
+                    self._capture_restore()
+                elif event == "select_region":
+                    self._select_region(payload)
+                elif event == "look_progress":
+                    if payload:
+                        self._set_stop_mode(True)
+                    else:
+                        self._set_stop_mode(False)
                 elif event == "online_consent":
                     self._confirm_online(*payload)
                 elif event == "context_inspect":
@@ -2576,6 +2696,208 @@ class NovaGUI:
         ctk.CTkLabel(box, text=subtitle, font=self.fonts.ui(13), text_color=MUTED, wraplength=360).pack()
 
     # -------------------- Memories --------------------
+    def _build_work_tab(self, win, tab):
+        """Memories › Work & privacy: work threads and their entries, conflicting facts, the don't-remember
+        list, export and the change log (Step 32)."""
+        f = self.fonts
+        toolbar = ctk.CTkFrame(tab, fg_color="transparent")
+        toolbar.pack(fill="x", pady=(6, 4))
+        switches = {}
+        for key, label in (("memory_recall_enabled", "Recall work and earlier chats"),
+                           ("memory_record_outcomes", "Keep what agent tasks did")):
+            var = tk.BooleanVar(value=bool(self.settings.get(key, True)))
+            switches[key] = var
+
+            def toggle(k=key, v=var):
+                self._persist_setting(k, bool(v.get()))
+                nova_recall.RECALL_IN_CHAT = bool(self.settings.get("memory_recall_enabled", True))
+
+            ctk.CTkSwitch(toolbar, text=label, variable=var, onvalue=True, offvalue=False, command=toggle,
+                          font=f.ui(12), text_color=TEXT, progress_color=ACCENT).pack(side="left", padx=(0, 14))
+        self._button(toolbar, "Export…", lambda: export(), kind="secondary", width=90).pack(side="right")
+        self._button(toolbar, "Change log", lambda: show_log(), kind="secondary", width=110).pack(side="right", padx=8)
+        listing = self._scroll_list(tab)
+        listing.pack(fill="both", expand=True)
+
+        def act(action, *args):
+            try:
+                result = with_db(action, *args)
+            except (ValueError, nova_recall.MemoryRefused) as exc:
+                messagebox.showwarning("Memories", str(exc), parent=win)
+                return None
+            except sqlite3.Error as exc:
+                log.error("Work memory action failed: %s", exc)
+                messagebox.showerror("Memories", f"The memory database couldn't be updated: {exc}", parent=win)
+                return None
+            render()
+            return result
+
+        def heading(text, note=None):
+            ctk.CTkLabel(listing, text=text, font=f.ui(15, semibold=True), text_color=TEXT, anchor="w").pack(
+                fill="x", padx=4, pady=(14, 2))
+            if note:
+                ctk.CTkLabel(listing, text=note, font=f.ui(12), text_color=MUTED, anchor="w", justify="left",
+                             wraplength=820).pack(fill="x", padx=4, pady=(0, 4))
+
+        def small(parent, text, command, danger=False):
+            button = ctk.CTkButton(parent, text=text, command=command, width=10, height=26, font=f.ui(12),
+                                   fg_color=DANGER_SOFT if danger else SURFACE_2, hover_color=BORDER,
+                                   text_color=DANGER if danger else TEXT, corner_radius=8)
+            button.pack(side="right", padx=2)
+            return button
+
+        def edit_entry(entry):
+            text = simpledialog.askstring("Correct entry", "Correct this entry (it'll count as what you said):",
+                                          initialvalue=entry.content, parent=win)
+            if text and text.strip() and text.strip() != entry.content:
+                act(nova_recall.update_entry, entry.id, text.strip())
+
+        def rename(thread):
+            text = simpledialog.askstring("Rename", "New name for this work:", initialvalue=thread.title, parent=win)
+            if text and text.strip():
+                act(nova_recall.rename_thread, thread.id, text.strip())
+
+        def delete_thread(thread):
+            if messagebox.askyesno("Delete work", f"Delete “{thread.title}” and everything recorded under it?\n\n"
+                                                  "Chats, memories and the task history aren't affected.",
+                                   icon="warning", parent=win):
+                act(nova_recall.delete_thread, thread.id)
+
+        def entry_row(entry):
+            card = ctk.CTkFrame(listing, fg_color=SURFACE, corner_radius=10)
+            card.pack(fill="x", pady=2, padx=(18, 8))
+            top = ctk.CTkFrame(card, fg_color="transparent")
+            top.pack(fill="x", padx=12, pady=(8, 0))
+            colors = {"next": (ACCENT_SOFT, ACCENT), "blocker": (DANGER_SOFT, DANGER), "done": ("#1d3326", SUCCESS),
+                      "decision": (SURFACE_2, TEXT), "fact": (SURFACE_2, MUTED)}
+            self._chip(top, entry.kind, *colors[entry.kind]).pack(side="left")
+            self._chip(top, nova_recall.CONFIDENCE_LABELS[entry.confidence], SURFACE_2,
+                       WARNING if entry.confidence == "inferred" else MUTED).pack(side="left", padx=(6, 0))
+            if entry.status != "open" and entry.kind != "done":
+                self._chip(top, entry.status, SURFACE_2, SUBTLE).pack(side="left", padx=(6, 0))
+            small(top, "Delete", lambda: act(nova_recall.delete_entry, entry.id), danger=True)
+            small(top, "Correct", lambda: edit_entry(entry))
+            if entry.kind in ("next", "blocker"):
+                if entry.status == "open":
+                    small(top, "Resolve", lambda: act(nova_recall.resolve_entry, entry.id, "resolved by you"))
+                else:
+                    small(top, "Reopen", lambda: act(nova_recall.reopen_entry, entry.id))
+            ctk.CTkLabel(card, text=entry.content, font=f.ui(13), anchor="w", justify="left", wraplength=760,
+                         text_color=TEXT if entry.status == "open" or entry.kind in ("done", "decision") else MUTED
+                         ).pack(fill="x", padx=12, pady=(4, 0))
+            meta = [format_timestamp(entry.updated_at)]
+            if entry.source_ref:
+                meta.append(entry.source_ref)
+            if entry.resolution:
+                meta.append(entry.resolution)
+            if not entry.durable:
+                meta.append("temporary" + (f", until {entry.expires_at[:10]}" if entry.expires_at else ""))
+            ctk.CTkLabel(card, text=" · ".join(meta), font=f.ui(11), text_color=SUBTLE, anchor="w").pack(
+                fill="x", padx=12, pady=(2, 8))
+
+        def render():
+            for child in listing.winfo_children():
+                child.destroy()
+            try:
+                threads = with_db(nova_recall.list_threads)
+                rows = {t.id: with_db(nova_recall.entries, t.id) for t in threads}
+                conflicts = with_db(nova_recall.conflicts)
+                superseded = [m for m in with_db(nova_memories.all_memories) if m.superseded_by]
+                terms = with_db(nova_recall.blocklist)
+            except sqlite3.Error as exc:
+                ctk.CTkLabel(listing, text=f"The memory database couldn't be read: {exc}", text_color=DANGER).pack()
+                return
+            heading("Work", "Decisions, what's done, blockers and next steps, grouped by topic or project. Nova "
+                            "recalls them when they're relevant, and “continue …” resumes open steps after checking "
+                            "what was actually done. Record one in chat with “decision: …”, “next: …”, “blocker: …” "
+                            "or “done: …”.")
+            if not threads:
+                ctk.CTkLabel(listing, text="Nothing recorded yet.", font=f.ui(12), text_color=SUBTLE,
+                             anchor="w").pack(fill="x", padx=4)
+            for thread in threads:
+                head = ctk.CTkFrame(listing, fg_color="transparent")
+                head.pack(fill="x", padx=4, pady=(10, 2))
+                ctk.CTkLabel(head, text=thread.title, font=f.ui(14, semibold=True), text_color=TEXT).pack(side="left")
+                self._chip(head, thread.status, SURFACE_2, MUTED).pack(side="left", padx=8)
+                small(head, "Delete", lambda t=thread: delete_thread(t), danger=True)
+                small(head, "Rename", lambda t=thread: rename(t))
+                small(head, "Reactivate" if thread.status == "done" else "Mark done",
+                      lambda t=thread: act(nova_recall.set_thread_status, t.id,
+                                           "active" if t.status == "done" else "done"))
+                items = rows[thread.id]
+                shown = [e for e in items if e.status == "open"] + [e for e in items if e.status != "open"][-10:]
+                for entry in shown:
+                    entry_row(entry)
+            heading("Conflicting facts", "Memories that say different things about the same subject. The newer one "
+                                         "is used; nothing is deleted unless you delete it.")
+            if not conflicts and not superseded:
+                ctk.CTkLabel(listing, text="No conflicts.", font=f.ui(12), text_color=SUBTLE, anchor="w").pack(
+                    fill="x", padx=4)
+            for older, newer in conflicts:
+                card = ctk.CTkFrame(listing, fg_color=SURFACE, corner_radius=10)
+                card.pack(fill="x", pady=2, padx=(4, 8))
+                ctk.CTkLabel(card, text=f"Older: “{older.content}”\nNewer: “{newer.content}”", font=f.ui(13),
+                             anchor="w", justify="left", wraplength=620, text_color=TEXT).pack(side="left", padx=12,
+                                                                                                 pady=8)
+                small(card, "Keep both", lambda o=older, n=newer: act(nova_memories.keep_both, o.id, n.id))
+                small(card, "Use the newer", lambda o=older, n=newer: act(nova_recall.supersede, o.id, n.id))
+            for memory in superseded:
+                card = ctk.CTkFrame(listing, fg_color=SURFACE, corner_radius=10)
+                card.pack(fill="x", pady=2, padx=(4, 8))
+                ctk.CTkLabel(card, text=f"Not used (replaced by #{memory.superseded_by}): “{memory.content}”",
+                             font=f.ui(13), anchor="w", justify="left", wraplength=620, text_color=MUTED).pack(
+                    side="left", padx=12, pady=8)
+                small(card, "Delete", lambda m=memory: act(nova_memories.delete_memory, m.id), danger=True)
+                small(card, "Use again", lambda m=memory: act(nova_recall.restore_superseded, m.id))
+            heading("Don't remember", "Topics Nova never stores or recalls. You can also say “don't remember "
+                                      "anything about …” in chat.")
+            add_row = ctk.CTkFrame(listing, fg_color="transparent")
+            add_row.pack(fill="x", padx=4, pady=(2, 4))
+            entry = self._entry(add_row, "A topic, e.g. my health", width=320)
+            entry.pack(side="left")
+            self._button(add_row, "Add", lambda: (act(nova_recall.block, entry.get()) if entry.get().strip() else None),
+                         width=70).pack(side="left", padx=8)
+            for term in terms:
+                row = ctk.CTkFrame(listing, fg_color=SURFACE, corner_radius=10)
+                row.pack(fill="x", pady=2, padx=(4, 8))
+                ctk.CTkLabel(row, text=term, font=f.ui(13), text_color=TEXT).pack(side="left", padx=12, pady=6)
+                small(row, "Delete what mentions it…", lambda t=term: purge(t), danger=True)
+                small(row, "Remove", lambda t=term: act(nova_recall.unblock, t))
+
+        def purge(term):
+            if messagebox.askyesno("Delete", f"Delete every memory and work note that mentions “{term}”?\n\nChats and "
+                                             "the task history aren't affected. This can't be undone (a backup "
+                                             "can restore it).", icon="warning", parent=win):
+                counts = act(nova_recall.purge_blocked, term)
+                if counts is not None:
+                    self.set_status(f"Deleted {counts[0]} memories and {counts[1]} work notes")
+
+        def export():
+            path = filedialog.asksaveasfilename(parent=win, title="Export Nova's memory", defaultextension=".json",
+                                                initialfile="nova-memory-export.json",
+                                                filetypes=[("JSON", "*.json")])
+            if not path:
+                return
+            try:
+                data = with_db(nova_recall.export_all)
+                atomic_write_text(Path(path), json.dumps(data, ensure_ascii=False, indent=2))
+            except (OSError, sqlite3.Error) as exc:
+                messagebox.showerror("Export", f"The export couldn't be written: {exc}", parent=win)
+                return
+            messagebox.showinfo("Export", f"Saved {len(data['memories'])} memories and {len(data['work'])} work "
+                                          f"topic(s) to:\n{path}\n\nIt holds personal information: keep it private.",
+                                parent=win)
+
+        def show_log():
+            rows = with_db(nova_recall.recent_changes, 40)
+            text = "\n".join(f"{r['at'][:16].replace('T', ' ')}  {r['action']} {r['item_type']}"
+                             + (f" #{r['item_id']}" if r["item_id"] is not None else "") + f"  ({r['origin']})"
+                             for r in rows) or "No changes recorded yet."
+            messagebox.showinfo("Memory change log", "Recent changes (contents are never logged):\n\n" + text,
+                                parent=win)
+
+        render()
+
     def _memory_save_checks(self, parent, content, exclude_id=None):
         """Warn about near-duplicates and instruction-like text; True to go ahead."""
         similar = [(m, score) for m, score in with_db(nova_memories.find_similar, content, exclude_id=exclude_id)
@@ -2605,7 +2927,14 @@ class NovaGUI:
         """'remember that …' in chat: ask before saving anything."""
         try:
             identical = with_db(nova_memories.find_identical, content)
-            if identical:
+            secret = nova_recall.sensitive(content)                       # Step 32: refused before asking
+            topic = None if secret else with_db(nova_recall.blocked, content)
+            if secret:
+                reply = f"I didn't save that: it looks like {secret}, and Nova never keeps those in its memory."
+            elif topic:
+                reply = (f"I didn't save that: you asked me not to remember anything about “{topic}”. "
+                         "(Change that in Memories › Work & privacy.)")
+            elif identical:
                 reply = f"That's already in my long-term memory: “{identical.content}”."
             else:
                 self.set_status("Confirm memory")
@@ -2616,8 +2945,12 @@ class NovaGUI:
                 elif not self._memory_save_checks(self.root, content):
                     reply = "Okay, I didn't save that."
                 else:
-                    with_db(nova_memories.add_memory, content, source="chat")
+                    saved = with_db(nova_memories.add_memory, content, source="chat")
                     reply = f"Saved to long-term memory: “{content}”. You can review or edit it in Memories."
+                    replaced = with_db(nova_recall.supersede_on_save, saved.memory)    # Step 32: newer value wins
+                    if replaced:
+                        reply += ("\n\nIt replaces " + ", ".join(f"“{m.content}”" for m in replaced) + ", which "
+                                  "stays in Memories but is no longer used.")
                     log.info("Memory saved from chat")
         except ValueError as exc:
             reply = f"I couldn't save that: {exc}"
@@ -2812,6 +3145,7 @@ class NovaGUI:
         )
         tabs.pack(fill="both", expand=True)
         list_tab, review_tab, preview_tab = tabs.add("Memories"), tabs.add("Review"), tabs.add("What Nova sees")
+        self._build_work_tab(win, tabs.add("Work & privacy"))           # Step 32
         try:
             tabs._segmented_button.configure(font=f.ui(13, semibold=True), height=34)
         except Exception:
@@ -2862,6 +3196,11 @@ class NovaGUI:
             self._chip(top, memory.category, ACCENT_SOFT, ACCENT).pack(side="left")
             if memory.pinned:
                 self._chip(top, "Pinned", "#1d3326", SUCCESS).pack(side="left", padx=(6, 0))
+            if memory.superseded_by:                              # Step 32: a newer fact on the same subject
+                replaced = self._chip(top, f"Replaced by #{memory.superseded_by}: not used", "#3a3220", WARNING)
+                replaced.pack(side="left", padx=(6, 0))
+                Tooltip(replaced, "A newer memory says something different about the same thing. Restore this one "
+                                  "in Memories › Work & privacy, or delete it.", f)
             if not memory.include:
                 self._chip(top, "Not used in replies", "#3a3220", WARNING).pack(side="left", padx=(6, 0))
             elif nova_memories.looks_like_instruction(memory.content):
@@ -4358,6 +4697,10 @@ class NovaGUI:
         except Exception as exc:
             log.error("Reminder check failed: %s", exc)
             self.set_status(f"Reminder check failed: {exc}")
+        try:                                           # Step 33: scheduled tasks, watches and notifications,
+            self._poll_automations()                   # in the same check (one scheduler)
+        except Exception as exc:
+            log.error("Scheduled task check failed: %s", exc)
         finally:
             self._schedule("reminders", 2000, self.poll_due_reminders)
 
@@ -4961,9 +5304,24 @@ class NovaGUI:
         def stop_speaking(icon, item):
             SPEAKER.stop()
 
+        def open_automations(icon, item):
+            self.root.after(0, self.open_automations)
+
+        def toggle_automations(icon, item):
+            self.root.after(0, lambda: self._set_automations(not self.settings.get("automation_enabled", True)))
+
         menu = pystray.Menu(
             pystray.MenuItem("Open Nova", open_window, default=True),
             pystray.MenuItem("Hide to tray", hide_window),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Automations & notifications", open_automations),          # Step 33
+            pystray.MenuItem("Run scheduled tasks and watches", toggle_automations,
+                             checked=lambda item: bool(self.settings.get("automation_enabled", True))),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Stop everything", lambda icon, item: self.stop_everything("tray")),   # Step 34
+            pystray.MenuItem("Pause new tasks", lambda icon, item: self.root.after(
+                0, lambda: self.set_tasks_paused(not nova_policy.GATE.paused)),
+                checked=lambda item: nova_policy.GATE.paused),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Hands-free listening", toggle_hands_free, checked=lambda item: self.wake_active),
             pystray.MenuItem(lambda item: "Resume listening" if self.voice_paused.is_set() else "Pause listening",
@@ -5256,7 +5614,71 @@ class NovaGUI:
             menu = option_menu(agent_controls, agent_vars[key], width=130)
             menu.configure(values=list(options), state="normal")
             menu.pack_configure(padx=(0, 8))
+        desktop_var = tk.BooleanVar(value=bool(self.settings.get("desktop_automation", True)))
+        switch_row(model_card, "Control apps on this PC",
+                   "The agent may bring Notepad, Calculator, Paint, VS Code, File Explorer and browser windows to the "
+                   "front, read them, type into Notepad and Calculator, press buttons and allowed shortcuts, and "
+                   "close windows. It checks the right window is active first; typing needs your approval of the "
+                   "plan, and saving, clipboard keys, dialogs and closing ask right before.", desktop_var)
+        browser_ok, browser_why = nova_browser.PlaywrightBrowser().available()
+        browser_var = tk.BooleanVar(value=bool(self.settings.get("browser_automation", False)) and browser_ok)
+        switch_row(model_card, "Browser automation",
+                   ("The agent may open web pages in its own browser window (a fresh profile without your cookies "
+                    "or passwords), read them, click links and buttons and fill in ordinary fields. Web searches, "
+                    "submitting forms and buttons that buy, send or delete ask first; sign-ins and CAPTCHAs are left "
+                    "to you. Uses Microsoft Edge or Chrome." if browser_ok else
+                    f"Unavailable: {browser_why}, then restart Nova."), browser_var, enabled=browser_ok)
         end_card(model_card)
+
+        # ---- Screen (Step 31) ----
+        screen_card = card(model_tab, pady=(14, 0))
+        heading(screen_card, "Screen (“look at my screen”)",
+                "Nova looks at the screen only when you ask, or when an agent step you approved needs to. A banner "
+                "shows while it does. Screenshots stay in memory on this PC and are never saved; only the "
+                "answer is kept.")
+        vision_var = tk.BooleanVar(value=bool(self.settings.get("vision_enabled", True)))
+        switch_row(screen_card, "Let Nova look at the screen",
+                   "“Look at my screen”, the Look at screen button, and agent steps that read the screen.", vision_var)
+        checks_var = tk.BooleanVar(value=bool(self.settings.get("vision_agent_checks", True)))
+        switch_row(screen_card, "Check app windows during automation",
+                   "Before the agent types or clicks, it reads the app's window for messages Windows didn't report, "
+                   "and it reads it again after saving or answering a dialog. Fast: text only, no image model.",
+                   checks_var)
+        ocr_ok, ocr_why = nova_vision.WindowsOcr().available()
+        ocr_var = tk.BooleanVar(value=bool(self.settings.get("vision_ocr", True)) and ocr_ok)
+        switch_row(screen_card, "Read screen text",
+                   "With Windows' built-in text recognition (OCR), on this PC." if ocr_ok else f"Unavailable: {ocr_why}.",
+                   ocr_var, enabled=ocr_ok)
+        model_use_var = tk.BooleanVar(value=bool(self.settings.get("vision_use_model", True)))
+        _switch, model_status = switch_row(
+            screen_card, "Understand pictures with a local image model",
+            "Checking which installed model can read images…", model_use_var)
+        remote_ok = nova_vision.is_local_host(nova_vision.ollama_host())
+        remote_var = tk.BooleanVar(value=bool(self.settings.get("vision_allow_remote", False)))
+        if not remote_ok:
+            switch_row(screen_card, "Send screenshots to Ollama on another computer",
+                       f"Ollama is set to {nova_vision.ollama_host()}, which isn't this PC. Off: Nova only reads "
+                       "screen text there, and screenshots never leave this PC.", remote_var)
+        exclusion_controls = heading(screen_card, "Always hidden",
+                                     "Windows whose title or app name contains one of these words are blacked out "
+                                     "before Nova reads a screenshot, separated by commas. Password fields are always "
+                                     "hidden.")
+        exclusions_entry = ctk.CTkEntry(exclusion_controls, width=520, height=34, font=f.ui(13), fg_color=SURFACE_2,
+                                        border_color=BORDER, text_color=TEXT)
+        exclusions_entry.insert(0, ", ".join(self.settings.get("vision_exclusions") or []))
+        exclusions_entry.pack(side="left")
+        end_card(screen_card)
+
+        def show_vision_model():
+            model, why = self.vision.model.choose(self.settings.get("vision_model"))
+            text = (f"{model} can read images (checked with Ollama). On this PC it takes about a minute per "
+                    "picture." if model else f"Unavailable: {why}.")
+            try:
+                win.after(0, lambda: model_status.configure(text=text) if model_status.winfo_exists() else None)
+            except (tk.TclError, RuntimeError):
+                pass
+
+        threading.Thread(target=show_vision_model, daemon=True, name="NovaVisionModelCheck").start()
         model_state = {"labels": {}}  # menu label -> model name
 
         def selected_model():
@@ -5520,6 +5942,17 @@ class NovaGUI:
             new["summarize_long_chats"] = bool(summarize_var.get())
             for key, (_label, options) in agent_choices.items():
                 new[key] = options.get(agent_vars[key].get(), nova_settings.DEFAULTS[key])
+            new["desktop_automation"] = bool(desktop_var.get())
+            if browser_ok:
+                new["browser_automation"] = bool(browser_var.get())
+            new["vision_enabled"] = bool(vision_var.get())
+            new["vision_agent_checks"] = bool(checks_var.get())
+            if ocr_ok:
+                new["vision_ocr"] = bool(ocr_var.get())
+            new["vision_use_model"] = bool(model_use_var.get())
+            new["vision_allow_remote"] = bool(remote_var.get()) and not remote_ok
+            new["vision_exclusions"] = list(dict.fromkeys(
+                " ".join(w.split()) for w in exclusions_entry.get().split(",") if w.strip()))[:40]
             new["tts_rate"] = int(round(rate_var.get()))
             new["tts_volume"] = round(volume_var.get() / 100, 2)
             choice = mic_labels.get(mic_var.get())
@@ -6399,11 +6832,22 @@ class NovaGUI:
         budget = context_budget(model, self.settings)
         planner = nova_agent.Planner(ollama.chat, model, model_capabilities(model), num_ctx=budget.num_ctx,
                                      timeout=limits["model_timeout"])
+        if self.settings.get("browser_automation", False):
+            if self.browser is None:
+                self.browser = nova_browser.PlaywrightBrowser()
+            self.browser.reset()                         # a new task may use it again after an emergency stop
         env = nova_agent.Env(
             services=self.task_runner.services, settings=dict(self.settings), connect=get_db_connection,
             approved=set(), project_id=self._chat_project_id(),
-            online=(self._online_http(), self.secrets) if nova_online.enabled(self.settings) else None)
+            online=(self._online_http(), self.secrets) if nova_online.enabled(self.settings) else None,
+            desktop=self.desktop if self.settings.get("desktop_automation", True) else None,
+            browser=self.browser if self.settings.get("browser_automation", False) else None,
+            intervene=lambda message: bool(self._agent_ask("intervene", message,
+                                                           timeout=nova_browser.INTERVENTION_WAIT)),
+            vision=self.vision if self.settings.get("vision_enabled", True) else None)
+        memory = nova_recall.AgentMemory(get_db_connection, self._chat_project_id(), dict(self.settings))   # Step 32
         self._agent_cancel = threading.Event()
+        self._start_emergency_hotkey()
 
         def on_event(kind, data):
             self.events.put(("agent_event", (kind, data)))
@@ -6419,7 +6863,7 @@ class NovaGUI:
             approve_step=lambda step, prepared: self._agent_ask("step", (step, prepared)),
             approve_folders=lambda step, folders: self._agent_ask("folders", (step, folders)),
             pick=lambda step, name, kind: self._agent_ask("pick", (step, kind)),
-            lock=self.task_runner._lock)
+            lock=self.task_runner._lock, memory=memory, origin="voice" if voice else "typed")   # Step 34
         self.events.put(("agent_event", ("open", request)))
         log.info("Agent task started (%s, %s)", model, "native tools" if planner.native else "structured JSON")
         try:
@@ -6430,6 +6874,8 @@ class NovaGUI:
             log.exception("Agent task crashed")
             reply = f"The agent stopped because of an unexpected error: {exc}. Nothing more was done."
             spoken = "The task stopped because of an unexpected error. Nothing more was done."
+        finally:
+            self._stop_emergency_hotkey()
         self._voice_approvals.clear()
         self._online_reply(session_id, text, reply, spoken if speak else False)
         ui = getattr(self, "_tasks_ui", None)
@@ -6461,6 +6907,15 @@ class NovaGUI:
             return
         if kind == "pick" and self._agent_voice:
             self.show_window()               # a file can only be chosen on screen
+        if kind == "intervene":              # Step 30: a sign-in page or CAPTCHA the user must handle
+            if ui is None or not ui["win"].winfo_exists():
+                answer.put(False)
+                return
+            ui["ask"](answer, f"Nova needs you: {payload}", "Continue", "Stop")
+            if self._agent_voice:
+                self._speak_quietly("I need you to do something in the browser window. Click Continue when "
+                                    "you're done.")
+            return
         if kind == "plan":
             if ui is None:
                 answer.put(False)
@@ -6515,6 +6970,992 @@ class NovaGUI:
         self._voice_approvals[approval] = decide
         self._speak_quietly(prompt)
 
+    # ---- stop everything / pause new tasks (Step 34) ----
+    def stop_everything(self, origin="button"):
+        """Stop every running task at once, from any thread, without waiting: the agent (typed, spoken or
+        scheduled), a `task:` run, the reply being written, speech, typing and Nova's browser. Nothing is undone;
+        what already happened stays recorded. Safe to call when nothing runs."""
+        self.emergency_stop()                                   # the agent, typing, Nova's browser
+        cancels = getattr(self, "_scheduled_cancels", None)
+        for cancel in list(cancels) if isinstance(cancels, set) else ():
+            cancel.set()
+        task_ui = getattr(self, "_task_ui", None)
+        if task_ui:
+            try:
+                task_ui["state"]["cancel"].set()
+            except (KeyError, TypeError):
+                pass
+        self._cancel_reply.set()
+        SPEAKER.stop()
+        nova_policy.log_decision(get_db_connection, None, None, None, "stop everything", "stopped", origin)
+        self.events.put(("status", "Stopped everything that was running. Nothing more will run."))
+
+    def set_tasks_paused(self, paused):
+        """Pause or resume new tasks from every origin (typed, voice, agent, `task:`, scheduled)."""
+        nova_policy.GATE.pause(bool(paused))
+        self._persist_setting("tasks_paused", bool(paused))
+        nova_policy.log_decision(get_db_connection, None, None, None, "pause new tasks" if paused else
+                                 "resume tasks", "paused" if paused else "allowed", "typed")
+        self.set_status("New tasks are paused" if paused else "Tasks can run again")
+        self._refresh_tray_menu()
+        refresh = getattr(self, "_safety_controls_refresh", None)
+        if refresh:
+            refresh()
+
+    def _start_global_stop_hotkey(self):
+        """Ctrl+Alt+Backspace stops everything, whenever Nova runs (if no other program already uses it)."""
+        if self._emergency_hotkey is None:
+            self._emergency_hotkey = nova_desktop.EmergencyHotkey(lambda: self.stop_everything("hotkey"))
+        try:
+            self._emergency_hotkey.start()
+        except Exception as exc:
+            log.info("Stop hotkey unavailable: %s", exc)
+
+    # ---- emergency stop (Step 30) ----
+    def emergency_stop(self):
+        """Stop the running agent task at once, from any thread: no further step, typing stops between two
+        characters, waits end, Nova's browser is closed, and an open question is answered “no”."""
+        cancel = self._agent_cancel
+        if cancel is not None:
+            cancel.set()
+        if self.browser is not None:
+            self.browser.abort()
+        log.info("Emergency stop")
+        self.events.put(("agent_emergency", None))
+
+    def _show_emergency_stop(self):
+        ui = self._agent_ui
+        if ui is not None and ui["win"].winfo_exists():
+            try:
+                ui["emergency"]()
+            except tk.TclError:
+                pass
+
+    def _start_emergency_hotkey(self):
+        """Step 34: the stop hotkey is registered for as long as Nova runs (it stops everything), so an agent
+        run only makes sure it's there."""
+        self._start_global_stop_hotkey()
+
+    def _stop_emergency_hotkey(self, shutting_down=False):
+        if not shutting_down:
+            return                            # it stays registered between tasks
+        if self._emergency_hotkey is not None:
+            try:
+                self._emergency_hotkey.stop()
+            except Exception as exc:
+                log.info("Couldn't release the emergency-stop hotkey: %s", exc)
+
+    def open_activity_log(self):
+        """The audit trail of changes made by agent tasks (files, apps, web pages; never contents)."""
+        try:
+            rows = with_db(lambda con: nova_agent.list_audit(con, 300))
+        except Exception as exc:
+            messagebox.showerror("Activity log", f"The activity log couldn't be read: {exc}", parent=self.root)
+            return
+        win = self._dialog("Activity log", "820x560", (560, 380))
+        body = ctk.CTkFrame(win, fg_color=BG)
+        body.pack(fill="both", expand=True, padx=26, pady=(22, 18))
+        self._dialog_header(body, "Activity log", "Every change agent tasks made or tried to make, newest first: "
+                                                  "files moved or created, apps typed into or closed, web pages "
+                                                  "opened and forms submitted. Contents are never recorded.")
+        box = ctk.CTkTextbox(body, font=self.fonts.ui(12), fg_color=SURFACE, text_color=TEXT, wrap="word")
+        box.pack(fill="both", expand=True)
+        icons = {"succeeded": "✓", "failed": "✗", "timed_out": "⏱", "skipped": "–"}
+        lines = [f"{r['at'][:16].replace('T', ' ')}  {icons.get(r['outcome'], '·')} {r['operation']}"
+                 + (f"\n      {r['target']}" if r["target"] and r["target"] not in r["operation"] else "")
+                 + (f"\n      {r['detail']}" if r["detail"] else "") for r in rows]
+        box.insert("1.0", "\n".join(lines) if lines else "Nothing yet: agent tasks haven't changed anything.")
+        box.configure(state="disabled")
+
+    # -------------------- work memory and privacy (Step 32) --------------------
+    def _memory_command(self, session_id, text):
+        """Worker thread: a reply for a memory command, or None if text isn't one."""
+        term = nova_recall.parse_no_store(text)
+        if term:
+            try:
+                term = with_db(nova_recall.block, term)
+            except nova_recall.MemoryRefused as exc:
+                return str(exc)
+            mentions = with_db(lambda con: (sum(nova_recall.blocked_by(term, f"{m.category} {m.content}")
+                                                for m in nova_memories.all_memories(con)),
+                                            sum(nova_recall.blocked_by(term, e.content)
+                                                for e in nova_recall.entries(con))))
+            reply = (f"Okay, I won't remember anything about “{term}”: new memories, notes of work and task records "
+                     "that mention it won't be kept, and nothing about it is recalled.")
+            if any(mentions):
+                reply += (f" {mentions[0]} saved memor{'y' if mentions[0] == 1 else 'ies'} and {mentions[1]} work "
+                          "note(s) already mention it; they're no longer used, and you can delete them in "
+                          "Memories › Work & privacy.")
+            return reply
+        term = nova_recall.parse_allow_store(text)
+        if term:
+            removed = with_db(nova_recall.unblock, term)
+            return (f"Okay, I can remember things about “{term}” again." if removed else
+                    f"“{term}” wasn't on your “don't remember” list.")
+        work = nova_recall.parse_work_command(text)
+        if work:
+            kind, title, content = work
+            try:
+                def record(con):
+                    thread = (nova_recall.thread_for(con, title) if title else
+                              nova_recall.thread_for(con, project_id=nova_context.session_project(con, session_id)))
+                    entry, created = nova_recall.add_entry(con, thread.id, kind, content, "user_stated",
+                                                           f"chat {session_id}")
+                    return thread, created
+                thread, created = with_db(record)
+            except nova_recall.MemoryRefused as exc:
+                return f"I didn't record that: {exc}"
+            label = {"decision": "Decision", "next": "Next step", "blocker": "Blocker", "done": "Done",
+                     "fact": "Note"}[kind]
+            return (f"{label} noted under “{thread.title}”: {content}" if created else
+                    f"That's already noted under “{thread.title}”.") + (
+                " Say “continue " + thread.title + "” later to pick it up." if kind in ("next", "blocker") else "")
+        topic = nova_recall.parse_status(text)
+        if topic:
+            brief = with_db(nova_recall.status_brief, topic)
+            return brief or f"I haven't recorded any work about “{topic}” yet."
+        return None
+
+    # -------------------- scheduled tasks, watches and notifications (Step 33) --------------------
+    def _start_automations(self):
+        """At start-up: finish what a crash or shutdown interrupted, and start watching folders."""
+        try:
+            with_db(nova_schedule.ensure_schema)             # additive tables, safe on every start
+            interrupted = with_db(nova_schedule.recover)
+            if interrupted:
+                log.info("%d scheduled run(s) were interrupted last time", interrupted)
+            self.file_watcher.refresh(with_db(nova_schedule.list_jobs, "active"))
+        except Exception as exc:
+            log.error("Scheduled tasks couldn't start: %s", exc)
+
+    def _set_automations(self, on):
+        self._persist_setting("automation_enabled", bool(on))
+        self.set_status("Scheduled tasks and watches " + ("on" if on else "paused"))
+        self._refresh_tray_menu()
+        self._automations_changed()
+
+    def _automations_changed(self):
+        try:
+            jobs = with_db(nova_schedule.list_jobs, "active") if self.settings.get("automation_enabled", True) else []
+            self.file_watcher.refresh(jobs)
+        except Exception as exc:
+            log.warning("Couldn't refresh the folder watches: %s", exc)
+        ui = self._automations_ui
+        if ui is not None:
+            try:
+                ui()
+            except tk.TclError:
+                self._automations_ui = None
+
+    def _poll_automations(self):
+        """Main thread, part of the one scheduler check: claim due tasks (each exactly once), check app states
+        every 15 s while such a watch exists, and deliver notifications."""
+        if self.settings.get("automation_enabled", True) and not nova_policy.GATE.paused:   # Step 34: paused
+            for claim in with_db(nova_schedule.claim_due):
+                self._launch_claim(claim)
+            if time.monotonic() >= self._app_check_at:
+                self._app_check_at = time.monotonic() + nova_schedule.APP_CHECK_SECONDS
+                apps = [j for j in with_db(nova_schedule.list_jobs, "active") if j.trigger == "app"]
+                for job in apps:
+                    try:
+                        running = bool(nova_actions.app_windows(job.config["app"]))
+                    except Exception:
+                        continue
+                    claim = with_db(nova_schedule.check_app_job, job, running)
+                    if claim is not None:
+                        self._launch_claim(claim)
+        for note in with_db(nova_schedule.due_for_delivery, self.settings):
+            self._deliver_notification(note)
+
+    def _on_file_changed(self, job_id):
+        job = with_db(nova_schedule.get_job, job_id)
+        if job is None or job.status != "active" or not self.settings.get("automation_enabled", True):
+            return
+        try:
+            claim = with_db(nova_schedule.check_file_job, job)
+        except nova_schedule.ScheduleError as exc:
+            log.warning("Folder watch %s: %s", job_id, exc)
+            return
+        if claim is not None:
+            self._launch_claim(claim)
+
+    def _launch_claim(self, claim):
+        log.info("Scheduled task %s starting (%s)", claim.job.id, claim.reason[:80])
+        threading.Thread(target=self._run_claim, args=(claim,), daemon=True,
+                         name=f"NovaScheduled-{claim.job.id}").start()
+
+    def _run_claim(self, claim):
+        """Worker thread: one scheduled run, start to finish."""
+        job = claim.job
+        try:
+            if job.trigger == "web":
+                change, summary = with_db(nova_schedule.check_web_job, job, self.settings)
+                if change == "unchanged":
+                    with_db(nova_schedule.finish, claim, "succeeded", summary)
+                    return
+                claim.reason = summary
+            if job.action == "notify":
+                with_db(nova_schedule.notify, job.name, job.request, claim.reason, job.id, claim.run_id)
+                with_db(nova_schedule.finish, claim, "succeeded", job.request, notify_result=False)
+                return
+            outcome = self._run_scheduled_agent(claim)
+            if outcome is None:
+                with_db(nova_schedule.defer, claim)           # another task was running: shortly, not lost
+                return
+            status, summary, error, run_id = outcome
+            with_db(nova_schedule.finish, claim, status, summary, error, run_id)
+            nova_agent.record_audit(get_db_connection, run_id, "scheduler", f"Scheduled task “{job.name}” ran: "
+                                    f"{claim.reason[:120]}", job.name, status, error)
+        except nova_schedule.ScheduleError as exc:
+            with_db(nova_schedule.finish, claim, "failed", error=str(exc))
+        except Exception as exc:
+            log.exception("Scheduled task %s crashed", job.id)
+            with_db(nova_schedule.finish, claim, "failed", error=f"Unexpected error: {exc}")
+        finally:
+            self.events.put(("automations_changed", None))
+
+    def _run_scheduled_agent(self, claim):
+        """Worker thread: the task's request through the agent engine, within what the user approved for it.
+        Returns (status, summary, error, agent run id), or None if another task is running."""
+        job = claim.job
+        permissions = job.permissions
+        request = job.request.replace("{files}", ", ".join(getattr(claim, "files", []) or []) or "the new files")
+        model = active_model()
+        limits = nova_agent.limits_from(self.settings)
+        planner = nova_agent.Planner(ollama.chat, model, model_capabilities(model),
+                                     num_ctx=context_budget(model, self.settings).num_ctx,
+                                     timeout=limits["model_timeout"])
+        env = nova_agent.Env(
+            services=self.task_runner.services, settings=dict(self.settings), connect=get_db_connection,
+            approved=set(permissions.get("folders") or ()),
+            online=(self._online_http(), self.secrets) if nova_online.enabled(self.settings) else None,
+            desktop=self.desktop if self.settings.get("desktop_automation", True) else None,
+            browser=self.browser if self.settings.get("browser_automation", False) else None,
+            vision=self.vision if self.settings.get("vision_enabled", True) else None)
+        review = []
+
+        def approve_plan(plan):
+            problem = nova_schedule.plan_allowed(plan, permissions)
+            if problem:
+                review.append(problem)
+                return False
+            return True
+
+        def approve_step(step, prepared):          # consequential: always the user, never automatic
+            self.events.put(("scheduled_attention", (job.name, prepared.description)))
+            return bool(self._agent_ask("step", (step, prepared), timeout=600))
+
+        cancel = threading.Event()
+        self._scheduled_cancels.add(cancel)
+        engine = nova_agent.AgentEngine(
+            self.agent_registry, planner, env, get_db_connection, limits,
+            approve_plan=approve_plan, approve_step=approve_step,
+            approve_folders=lambda step, folders: nova_schedule.folder_allowed(folders, permissions),
+            pick=lambda step, name, kind: None, lock=self.task_runner._lock,
+            memory=nova_recall.AgentMemory(get_db_connection, None, dict(self.settings)), origin="schedule")
+        try:
+            report = engine.run(request, cancel)
+        finally:
+            self._scheduled_cancels.discard(cancel)
+        if report.status == "rejected" and any("already running" in p for p in report.problems):
+            return None
+        summary = report.text()[:1500]
+        if review:
+            return ("needs_review", "Nothing was run.", f"{review[0]}. Open Automations to check and approve the "
+                                                        "plan again.", report.run_id)
+        status = {"succeeded": "succeeded", "cancelled": "cancelled"}.get(report.status, "failed")
+        error = None if status == "succeeded" else ("; ".join(report.problems[:2]) or
+                                                    next((s.error for s in report.steps if s.error), None) or
+                                                    report.status)
+        return status, summary, error, report.run_id
+
+    def _deliver_notification(self, note):
+        """Main thread: a Windows notification (through the tray icon), a pop-up for problems or when the tray
+        isn't available, and speech if the task asks for it. Quiet hours were already applied."""
+        job = with_db(nova_schedule.get_job, note.job_id) if note.job_id else None
+        hidden = self.root.state() == "withdrawn"
+        toast = False
+        if self.tray_icon is not None:
+            try:
+                self.tray_icon.notify(f"{note.body[:180]}\n{note.reason[:80]}".strip(), note.title[:60])
+                toast = True
+            except Exception as exc:
+                log.debug("Windows notification failed: %s", exc)
+        if note.level == "warning" or not toast or not hidden:
+            self._show_notification_window(note)
+        if job is not None and job.speak:
+            threading.Thread(target=lambda: self._speak_quietly(f"{note.title}. {note.body[:200]}"),
+                             daemon=True).start()
+        try:
+            self.root.bell()
+        except tk.TclError:
+            pass
+        self._automations_changed()
+
+    def _show_notification_window(self, note):
+        self._note_windows = [w for w in self._note_windows if w.winfo_exists()]
+        if len(self._note_windows) >= 3:
+            self.set_status(f"{note.title} (see Automations › Notifications)")
+            return
+        f = self.fonts
+        win = ctk.CTkToplevel(self.root, fg_color=BG)
+        win.title("Nova notification")
+        win.resizable(False, False)
+        self._apply_icon(win)
+        width, height = 460, 280
+        offset = 34 * len(self._note_windows)
+        win.geometry(f"{width}x{height}+{max(0, win.winfo_screenwidth() - width - 48 - offset)}+"
+                     f"{max(0, win.winfo_screenheight() - height - 110 - offset)}")
+        win.attributes("-topmost", True)
+        body = ctk.CTkFrame(win, fg_color=BG)
+        body.pack(fill="both", expand=True, padx=20, pady=16)
+        buttons = ctk.CTkFrame(body, fg_color="transparent")
+        buttons.pack(side="bottom", fill="x")
+        ctk.CTkLabel(body, text=note.title, font=f.heading(17), text_color=WARNING if note.level == "warning" else TEXT,
+                     anchor="w", justify="left", wraplength=410).pack(fill="x")
+        ctk.CTkLabel(body, text=f"{note.created_at} ({nova_schedule.tz_label()})", font=f.ui(11), text_color=SUBTLE,
+                     anchor="w").pack(fill="x")
+        if note.reason:
+            ctk.CTkLabel(body, text=f"Why: {note.reason}", font=f.ui(12), text_color=MUTED, anchor="w",
+                         justify="left", wraplength=410).pack(fill="x", pady=(6, 0))
+        ctk.CTkLabel(body, text=note.body[:400], font=f.ui(12), text_color=TEXT, anchor="w", justify="left",
+                     wraplength=410).pack(fill="x", pady=(6, 0))
+
+        def act(status, minutes=None):
+            with_db(nova_schedule.set_notification, note.id, status, minutes)
+            win.destroy()
+            self._automations_changed()
+
+        self._button(buttons, "Dismiss", lambda: act("dismissed"), kind="secondary", width=84).pack(side="right")
+        self._button(buttons, "Snooze 1 h", lambda: act("snoozed", 60), kind="secondary", width=96).pack(
+            side="right", padx=8)
+        self._button(buttons, "Inspect", lambda: (act("read"), self.open_automations("Notifications")),
+                     width=84).pack(side="left")
+        self._note_windows.append(win)
+
+    def _automation_command(self, session_id, text, draft):
+        """Worker thread: “list my automations”, or a draft task to review in the editor."""
+        if draft == "list":
+            jobs = with_db(nova_schedule.list_jobs)
+            if not jobs:
+                reply = "You have no scheduled tasks or watches yet. Open Automations to add one."
+            else:
+                reply = "Your scheduled tasks and watches:\n" + "\n".join(
+                    f"- **{j.name}** ({j.status}): {j.describe_trigger()}" + (
+                        f"; next {nova_reminders.when(j.due)}" if j.due and j.status == "active" else "") + (
+                        f"; last run {j.last_status}" if j.last_status else "") for j in jobs)
+            self._online_reply(session_id, text, reply, False)
+            return
+        self.events.put(("automation_draft", draft))
+        self._online_reply(session_id, text, "Review it in the window that opened: nothing is scheduled until you "
+                                             "approve it (and, for tasks Nova carries out, check their plan).", False)
+
+    def open_automations(self, tab=None):
+        """Automations: scheduled tasks and watches (list, pause, resume, run now, edit, delete, history),
+        notifications (dismiss, snooze, inspect), and quiet hours."""
+        existing = getattr(self, "_automations_window", None)
+        if existing is not None and existing.winfo_exists():
+            existing.deiconify()
+            existing.lift()
+            if tab:
+                existing.tabs.set(tab)
+            return
+        f = self.fonts
+        win = self._dialog("Automations", "940x700", (780, 520))
+        self._automations_window = win
+        body = ctk.CTkFrame(win, fg_color=BG)
+        body.pack(fill="both", expand=True, padx=26, pady=(22, 18))
+        self._dialog_header(body, "Automations",
+                            "Scheduled tasks and watches run while Nova is open or in the tray. Tasks Nova carries "
+                            "out use the agent with the same tools, approvals, limits and history as typed requests; "
+                            "anything consequential still asks you first.")
+        top = ctk.CTkFrame(body, fg_color="transparent")
+        top.pack(fill="x", pady=(0, 6))
+        enabled = tk.BooleanVar(value=bool(self.settings.get("automation_enabled", True)))
+        ctk.CTkSwitch(top, text="Run scheduled tasks and watches", variable=enabled, onvalue=True, offvalue=False,
+                      command=lambda: self._set_automations(bool(enabled.get())), font=f.ui(13), text_color=TEXT,
+                      progress_color=ACCENT).pack(side="left")
+        quiet = tk.BooleanVar(value=bool(self.settings.get("quiet_hours_enabled", False)))
+        start = self._entry(top, "22:00", width=70)
+        start.insert(0, self.settings.get("quiet_start") or "22:00")
+        end = self._entry(top, "07:00", width=70)
+        end.insert(0, self.settings.get("quiet_end") or "07:00")
+
+        def save_quiet():
+            for widget, key in ((start, "quiet_start"), (end, "quiet_end")):
+                value = widget.get().strip()
+                if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", value):
+                    messagebox.showwarning("Quiet hours", "Use HH:MM times, like 22:00.", parent=win)
+                    return
+                self._persist_setting(key, value)
+            self._persist_setting("quiet_hours_enabled", bool(quiet.get()))
+
+        end.pack(side="right")
+        ctk.CTkLabel(top, text="to", font=f.ui(12), text_color=MUTED).pack(side="right", padx=4)
+        start.pack(side="right")
+        ctk.CTkSwitch(top, text="Quiet hours", variable=quiet, onvalue=True, offvalue=False, command=save_quiet,
+                      font=f.ui(13), text_color=TEXT, progress_color=ACCENT).pack(side="right", padx=8)
+        start.bind("<FocusOut>", lambda _e: save_quiet())
+        end.bind("<FocusOut>", lambda _e: save_quiet())
+        tabs = ctk.CTkTabview(body, fg_color=BG, corner_radius=12, anchor="w", segmented_button_fg_color=SURFACE,
+                              segmented_button_selected_color=ACCENT, segmented_button_selected_hover_color=ACCENT_HOVER,
+                              segmented_button_unselected_color=SURFACE,
+                              segmented_button_unselected_hover_color=SURFACE_2, text_color=TEXT)
+        tabs.pack(fill="both", expand=True)
+        win.tabs = tabs
+        jobs_tab, notes_tab = tabs.add("Scheduled & watches"), tabs.add("Notifications")
+        bar = ctk.CTkFrame(jobs_tab, fg_color="transparent")
+        bar.pack(fill="x", pady=(4, 4))
+        self._button(bar, "+  New", lambda: self._automation_editor(win, on_saved=render), width=100).pack(side="right")
+        job_list = self._scroll_list(jobs_tab)
+        job_list.pack(fill="both", expand=True)
+        note_list = self._scroll_list(notes_tab)
+        note_list.pack(fill="both", expand=True)
+
+        def act(action, *args):
+            try:
+                with_db(action, *args)
+            except (nova_schedule.ScheduleError, ValueError) as exc:
+                messagebox.showwarning("Automations", str(exc), parent=win)
+            self._automations_changed()
+
+        def small(parent, text, command, danger=False):
+            ctk.CTkButton(parent, text=text, command=command, width=10, height=26, font=f.ui(12),
+                          fg_color=DANGER_SOFT if danger else SURFACE_2, hover_color=BORDER,
+                          text_color=DANGER if danger else TEXT, corner_radius=8).pack(side="right", padx=2)
+
+        def run_now(job):
+            claim = with_db(nova_schedule.fire_event, job, "Run now (you asked)")
+            if claim is None:
+                messagebox.showinfo("Run now", "It's already running, or ran less than a minute ago.", parent=win)
+                return
+            self.set_status(f"Running “{job.name}”…")
+            self._launch_claim(claim)
+            self._automations_changed()
+
+        def show_history(job):
+            rows = with_db(nova_schedule.history, job.id, 15)
+            text = "\n\n".join(f"{r['started']} ({r['status']}, attempt {r['attempt']})\nWhy: {r['reason']}"
+                               + (f"\nProblem: {r['error']}" if r["error"] else "") for r in rows) or "No runs yet."
+            messagebox.showinfo(f"History — {job.name}", f"Times are this PC's local time ({nova_schedule.tz_label()})."
+                                                        f"\n\n{text[:3500]}", parent=win)
+
+        def delete(job):
+            if messagebox.askyesno("Delete", f"Delete “{job.name}” and its history?", icon="warning", parent=win):
+                act(nova_schedule.delete_job, job.id)
+
+        def render():
+            if not win.winfo_exists():
+                return
+            for child in job_list.winfo_children() + note_list.winfo_children():
+                child.destroy()
+            now = datetime.now()
+            jobs = with_db(nova_schedule.list_jobs)
+            if not jobs:
+                ctk.CTkLabel(job_list, text="Nothing scheduled yet. Try “schedule every weekday at 9am: find invoices "
+                                            "in downloads”, “watch downloads for *.pdf” or “notify me when notepad "
+                                            "closes” in chat, or click New.", font=f.ui(12), text_color=SUBTLE,
+                             wraplength=820, justify="left", anchor="w").pack(fill="x", padx=4, pady=8)
+            for job in jobs:
+                card = ctk.CTkFrame(job_list, fg_color=SURFACE, corner_radius=12)
+                card.pack(fill="x", pady=3, padx=(0, 8))
+                head = ctk.CTkFrame(card, fg_color="transparent")
+                head.pack(fill="x", padx=14, pady=(10, 0))
+                ctk.CTkLabel(head, text=job.name, font=f.ui(14, semibold=True), text_color=TEXT).pack(side="left")
+                colors = {"active": ("#1d3326", SUCCESS), "paused": (SURFACE_2, MUTED), "done": (SURFACE_2, SUBTLE),
+                          "needs_review": (DANGER_SOFT, DANGER)}
+                self._chip(head, job.status.replace("_", " "), *colors[job.status]).pack(side="left", padx=8)
+                self._chip(head, "Nova does it" if job.action == "agent" else "Notification", SURFACE_2, MUTED).pack(
+                    side="left")
+                small(head, "Delete", lambda j=job: delete(j), danger=True)
+                small(head, "History", lambda j=job: show_history(j))
+                small(head, "Edit", lambda j=job: self._automation_editor(win, job=j, on_saved=render))
+                if job.status == "active":
+                    small(head, "Pause", lambda j=job: act(nova_schedule.set_status, j.id, "paused"))
+                    small(head, "Run now", lambda j=job: run_now(j))
+                elif job.status in ("paused", "needs_review"):
+                    small(head, "Resume", lambda j=job: act(nova_schedule.set_status, j.id, "active"))
+                lines = [job.describe_trigger(now)]
+                if job.action == "agent":
+                    lines.append(f"Does: {job.request[:160]}  ·  allowed: "
+                                 + ", ".join(t.replace("_", " ") for t in job.permissions.get("tools", [])))
+                if job.due and job.status == "active":
+                    lines.append(f"Next: {nova_reminders.when(job.due, now)} ({job.timezone or nova_schedule.tz_label()})")
+                if job.last_run_at:
+                    lines.append(f"Last run: {job.last_run_at} · {job.last_status}"
+                                 + (f" · {job.last_error}" if job.last_error else ""))
+                if job.retry_at:
+                    lines.append(f"Retry: {nova_reminders.when(job.retry_at, now)}")
+                ctk.CTkLabel(card, text="\n".join(lines), font=f.ui(12), text_color=MUTED, anchor="w", justify="left",
+                             wraplength=820).pack(fill="x", padx=14, pady=(4, 10))
+            notes = with_db(nova_schedule.notifications)
+            if not notes:
+                ctk.CTkLabel(note_list, text="No notifications.", font=f.ui(12), text_color=SUBTLE).pack(pady=8)
+            for note in notes[:100]:
+                card = ctk.CTkFrame(note_list, fg_color=SURFACE, corner_radius=12)
+                card.pack(fill="x", pady=3, padx=(0, 8))
+                head = ctk.CTkFrame(card, fg_color="transparent")
+                head.pack(fill="x", padx=14, pady=(10, 0))
+                ctk.CTkLabel(head, text=note.title, font=f.ui(13, semibold=True),
+                             text_color=WARNING if note.level == "warning" else TEXT).pack(side="left")
+                self._chip(head, note.status + (" · quiet hours" if note.quiet else ""), SURFACE_2, MUTED).pack(
+                    side="left", padx=8)
+                small(head, "Dismiss", lambda n=note: act(nova_schedule.set_notification, n.id, "dismissed"))
+                small(head, "Snooze 1 h", lambda n=note: act(nova_schedule.set_notification, n.id, "snoozed", 60))
+                if note.status == "new":
+                    small(head, "Mark read", lambda n=note: act(nova_schedule.set_notification, n.id, "read"))
+                ctk.CTkLabel(card, text=f"{note.created_at} · Why: {note.reason or '—'}\n{note.body[:500]}",
+                             font=f.ui(12), text_color=MUTED, anchor="w", justify="left", wraplength=820).pack(
+                    fill="x", padx=14, pady=(4, 10))
+
+        self._automations_ui = render
+        render()
+        if tab:
+            tabs.set(tab)
+
+    def _automation_editor(self, parent, job=None, draft=None, on_saved=None):
+        """New or edit: what to do, when or on what, and options. Agent tasks need their plan checked, and
+        the user approves the tools and folders it uses."""
+        f = self.fonts
+        win = ctk.CTkToplevel(parent, fg_color=BG)
+        win.title(("Edit" if job else "New") + " automation — Nova")
+        win.geometry("640x720")
+        win.transient(parent)
+        self._apply_icon(win)
+        win.after(80, lambda: (win.lift(), win.focus_force()))
+        body = ctk.CTkFrame(win, fg_color=BG)
+        body.pack(fill="both", expand=True, padx=24, pady=18)
+        footer = ctk.CTkFrame(body, fg_color="transparent")
+        footer.pack(side="bottom", fill="x", pady=(10, 0))
+        form = self._scroll_list(body)
+        form.pack(fill="both", expand=True)
+        source = job or draft
+        state = {"permissions": dict(job.permissions) if job else None, "checked_request": job.request if job else None}
+
+        def label(text):
+            ctk.CTkLabel(form, text=text, font=f.ui(13, semibold=True), text_color=MUTED, anchor="w").pack(
+                fill="x", pady=(10, 3))
+
+        label("Name")
+        name = self._entry(form, "e.g. Morning invoice check", width=560)
+        name.pack(anchor="w")
+        label("What happens")
+        action = tk.StringVar(value=(source.action if source else "agent"))
+        actions = ctk.CTkSegmentedButton(form, values=["agent", "notify"], variable=action, font=f.ui(12))
+        actions.pack(anchor="w")
+        ctk.CTkLabel(form, text="agent: Nova carries out a request (like “agent: …”).  notify: just a notification "
+                                "with the text below. {files} stands for the files that triggered a folder watch.",
+                     font=f.ui(11), text_color=SUBTLE, wraplength=560, justify="left", anchor="w").pack(fill="x")
+        request = ctk.CTkTextbox(form, height=70, font=f.ui(13), fg_color=SURFACE, text_color=TEXT)
+        request.pack(fill="x", pady=(4, 0))
+        label("When")
+        trigger = tk.StringVar(value=(source.trigger if source else "time"))
+        ctk.CTkSegmentedButton(form, values=["time", "file", "app", "web"], variable=trigger, font=f.ui(12),
+                               command=lambda _v: show_fields()).pack(anchor="w")
+        fields = ctk.CTkFrame(form, fg_color="transparent")
+        fields.pack(fill="x", pady=(6, 0))
+        entries = {}
+
+        def field(key, placeholder, width=260, value=""):
+            row = ctk.CTkFrame(fields, fg_color="transparent")
+            row.pack(fill="x", pady=2)
+            ctk.CTkLabel(row, text=placeholder, font=f.ui(12), text_color=MUTED, width=150, anchor="w").pack(side="left")
+            entry = self._entry(row, placeholder, width=width)
+            if value:
+                entry.insert(0, str(value))
+            entry.pack(side="left")
+            entries[key] = entry
+
+        def show_fields():
+            for child in fields.winfo_children():
+                child.destroy()
+            entries.clear()
+            config = (source.config if source and source.trigger == trigger.get() else {}) or {}
+            sched = getattr(source, "schedule", None) if draft else None
+            due = (job.due if job else (sched.due if sched else None))
+            rule = job.rule if job else (sched.rule if sched else None)
+            if trigger.get() == "time":
+                field("date", "Date (YYYY-MM-DD)", 160, due.strftime("%Y-%m-%d") if due else "")
+                field("time", "Time (HH:MM)", 100, due.strftime("%H:%M") if due else "09:00")
+                field("repeat", "Repeat", 260, rule or "once")
+                ctk.CTkLabel(fields, text="Repeat: once, daily, weekly:MO,WE,FR, monthly:15, monthly:last, every:30 "
+                                          "(minutes)", font=f.ui(11), text_color=SUBTLE, anchor="w").pack(fill="x")
+            elif trigger.get() == "file":
+                field("folder", "Folder", 420, config.get("folder", ""))
+                field("pattern", "File names", 200, config.get("pattern", "*"))
+                field("events", "Changes", 260, ",".join(config.get("events", ["created"])))
+                ctk.CTkLabel(fields, text="Changes: created, modified, deleted (comma-separated). Only files directly "
+                                          "in the folder. Watched by Windows: no polling.", font=f.ui(11),
+                             text_color=SUBTLE, anchor="w").pack(fill="x")
+            elif trigger.get() == "app":
+                field("app", "App", 200, config.get("app", "notepad"))
+                field("when", "When it", 120, config.get("when", "opens"))
+            else:
+                field("url", "Page (https)", 420, config.get("url", ""))
+                field("repeat", "Check", 160, rule or "every:360")
+                ctk.CTkLabel(fields, text="Only if online integrations are on. At most once an hour (every:60).",
+                             font=f.ui(11), text_color=SUBTLE, anchor="w").pack(fill="x")
+
+        label("Options")
+        options = ctk.CTkFrame(form, fg_color="transparent")
+        options.pack(fill="x")
+        missed = tk.StringVar(value=job.missed_policy if job else "run_once")
+        notify = tk.StringVar(value=job.notify if job else "always")
+        retries = tk.StringVar(value=str(job.max_retries if job else 1))
+        speak = tk.BooleanVar(value=bool(job.speak) if job else False)
+        for text, var, values in (("If missed", missed, ["run_once", "skip"]), ("Notify", notify, list(nova_schedule.NOTIFY)),
+                                  ("Retries", retries, ["0", "1", "2", "3"])):
+            ctk.CTkLabel(options, text=text, font=f.ui(12), text_color=MUTED).pack(side="left", padx=(0, 4))
+            ctk.CTkOptionMenu(options, variable=var, values=values, width=110, font=f.ui(12)).pack(side="left",
+                                                                                                  padx=(0, 12))
+        ctk.CTkCheckBox(form, text="Also say it aloud (not during quiet hours)", variable=speak, font=f.ui(12),
+                        text_color=TEXT).pack(anchor="w", pady=(8, 0))
+        label("What this task may do")
+        plan_note = ctk.CTkLabel(form, text="", font=f.ui(12), text_color=MUTED, anchor="w", justify="left",
+                                 wraplength=560)
+        plan_note.pack(fill="x")
+
+        if source:
+            name.insert(0, source.name)
+            request.insert("1.0", source.request)
+            if draft is not None and draft.problem:
+                plan_note.configure(text=draft.problem, text_color=WARNING)
+        show_fields()
+        if job and job.action == "agent":
+            plan_note.configure(text="Approved: " + ", ".join(t.replace("_", " ") for t in job.permissions.get(
+                "tools", [])) + (f"; folders: {', '.join(job.permissions.get('folders', []))}"
+                                 if job.permissions.get("folders") else ""))
+
+        def current_request():
+            return request.get("1.0", "end").strip()
+
+        def check_plan():
+            text = current_request().replace("{files}", "the new files")
+            if not text:
+                return
+            plan_note.configure(text="Checking the plan with the agent (nothing runs)…", text_color=WARNING)
+
+            def work():
+                model = active_model()
+                planner = nova_agent.Planner(ollama.chat, model, model_capabilities(model),
+                                             num_ctx=context_budget(model, self.settings).num_ctx)
+                env = nova_agent.Env(services=self.task_runner.services, settings=dict(self.settings),
+                                     connect=get_db_connection,
+                                     desktop=self.desktop if self.settings.get("desktop_automation", True) else None,
+                                     vision=self.vision)
+                try:
+                    plan, problems = nova_agent.AgentEngine(self.agent_registry, planner, env, None).preview(text)
+                except nova_agent.AgentError as exc:
+                    plan, problems = None, [str(exc)]
+                self.root.after(0, lambda: show_plan(plan, problems))
+
+            threading.Thread(target=work, daemon=True, name="NovaPlanCheck").start()
+
+        def show_plan(plan, problems):
+            if not win.winfo_exists():
+                return
+            if problems or plan is None or not plan.steps:
+                plan_note.configure(text="This can't be scheduled: " + ("; ".join(problems[:2]) if problems else
+                                                                        "the agent found nothing to do."),
+                                    text_color=DANGER)
+                state["permissions"] = None
+                return
+            perms = nova_schedule.permissions_for(plan)
+            steps = "\n".join(f"• {s.description or s.tool} [{nova_agent.SAFETY_LABELS[s.safety]}]" for s in plan.steps)
+            if not messagebox.askyesno("Approve what this task may do", f"Each run may use:\n\n{steps}\n\nFolders: "
+                                       f"{', '.join(perms['folders']) or 'none'}\n\nLater runs that need anything "
+                                       "more won't run; they'll ask you to review. Consequential steps still ask "
+                                       "right before. Approve?", parent=win):
+                return
+            state["permissions"], state["checked_request"] = perms, current_request()
+            plan_note.configure(text="Approved: " + ", ".join(t.replace("_", " ") for t in perms["tools"]),
+                                text_color=SUCCESS)
+
+        self._button(form, "Check the plan…", check_plan, kind="secondary", width=150).pack(anchor="w", pady=(6, 0))
+
+        def schedule_from_fields():
+            if trigger.get() not in ("time", "web"):
+                return None
+            repeat = entries["repeat"].get().strip() or "once"
+            if trigger.get() == "web":
+                minutes_rule = repeat
+                return nova_reminders.Schedule(nova_reminders.next_occurrence(minutes_rule, datetime.now().strftime(
+                    "%H:%M"), datetime.now()), minutes_rule, datetime.now().strftime("%H:%M"))
+            date_text, time_text = entries["date"].get().strip(), entries["time"].get().strip()
+            if repeat == "once":
+                return nova_reminders.schedule_from_fields(date_text, time_text, "once")
+            rule = nova_reminders.validate_rule(repeat)
+            if not re.fullmatch(r"\d{1,2}:\d{2}", time_text):
+                raise ValueError("Use HH:MM for the time.")
+            anchor = f"{int(time_text.split(':')[0]):02d}:{time_text.split(':')[1]}"
+            return nova_reminders.Schedule(nova_reminders.next_occurrence(rule, anchor, datetime.now()), rule, anchor)
+
+        def save():
+            try:
+                kind = action.get()
+                text = current_request()
+                if kind == "agent" and (state["permissions"] is None or state["checked_request"] != text):
+                    raise ValueError("Check the plan first (and approve it), so the task can only do what you "
+                                     "approved.")
+                config = {k: (v.get().split(",") if k == "events" else v.get()) for k, v in entries.items()
+                          if k not in ("date", "time", "repeat")}
+                sched = schedule_from_fields()
+                options = dict(missed_policy=missed.get(), notify=notify.get(), max_retries=int(retries.get()),
+                               speak=bool(speak.get()))
+                if job is None:
+                    with_db(nova_schedule.create_job, name.get(), kind, text, trigger.get(), config, sched,
+                            state["permissions"] if kind == "agent" else {}, **options)
+                else:
+                    if job.trigger != trigger.get() or job.action != kind:
+                        raise ValueError("To change what kind of task this is, delete it and add a new one.")
+                    changes = dict(options, name=name.get(), request=text)
+                    if kind == "agent":
+                        changes["permissions"] = state["permissions"]
+                    if sched is not None:
+                        changes["schedule"] = sched
+                    if config:
+                        changes["config"] = config
+                    with_db(nova_schedule.update_job, job.id, **changes)
+            except (ValueError, nova_schedule.ScheduleError) as exc:
+                messagebox.showwarning("Automation", str(exc), parent=win)
+                return
+            win.destroy()
+            self._automations_changed()
+            if on_saved:
+                on_saved()
+
+        self._button(footer, "Save", save, width=100).pack(side="right")
+        self._button(footer, "Cancel", win.destroy, kind="secondary", width=100).pack(side="right", padx=8)
+
+    # -------------------- looking at the screen (Step 31) --------------------
+    LOOK_QUESTION = "What's on my screen? Point out any dialog, error or message, and what I might do next."
+
+    def _look_at_screen(self, session_id, text, request, speak):
+        """Worker thread: capture what was asked for, read it on this PC, and answer, saying what was seen."""
+        if not self.settings.get("vision_enabled", True):
+            self._online_reply(session_id, text, "Screen access is switched off, so Nova didn't look. Switch it on in "
+                                                 "Settings › Model › Screen.", speak)
+            return
+        question = request.question or self.LOOK_QUESTION
+        where, spoken = {}, False
+        self._cancel_reply.clear()
+        try:
+            if request.target == "region":
+                answer = queue.Queue()
+                self.events.put(("select_region", answer))
+                try:
+                    where["region"] = answer.get(timeout=180)
+                except queue.Empty:
+                    where["region"] = None
+                if not where["region"]:
+                    self._online_reply(session_id, text, "No area was selected, so nothing was captured.", speak)
+                    return
+            elif request.target == "monitor":
+                where["monitor"] = request.monitor
+            elif request.target == "window":
+                windows = sorted(self.desktop.windows(request.app), key=lambda w: (not w.active, w.minimized))
+                if not windows:
+                    self._online_reply(session_id, text, f"{nova_desktop.app_title(request.app)} isn't open, so there's "
+                                                         "no window to look at.", speak)
+                    return
+                where["window"] = windows[0].handle
+            self.events.put(("look_progress", True))
+            observation = self.vision.look(request.target, question=question, cancel=self._cancel_reply.is_set,
+                                           **where)
+            answer_text = self.vision.answer(observation, question, cancel=self._cancel_reply.is_set)
+            reply = f"{answer_text}\n\n{observation.explain()}"
+            spoken = nova_voice.speakable(answer_text, 300) if speak else False
+        except nova_vision.VisionError as exc:
+            reply = ("Stopped. Nothing more was done with the screenshot, and it wasn't saved." if str(exc) == "Stopped."
+                     else f"Nova couldn't look at the screen: {exc}")
+            spoken = nova_voice.speakable(reply, 200) if speak else False
+        except Exception as exc:
+            log.exception("Looking at the screen failed")
+            reply = f"Looking at the screen failed unexpectedly: {exc}"
+            spoken = "Looking at the screen failed." if speak else False
+        finally:
+            self.events.put(("look_progress", False))
+        self._online_reply(session_id, text, reply, spoken)
+
+    @contextmanager
+    def _hidden_for_capture(self):
+        """Worker thread: Nova's windows step aside for the moment the screen is captured, then come back."""
+        if threading.current_thread() is threading.main_thread():
+            yield                                   # can't wait for the window here; own windows are masked anyway
+            return
+        ready = threading.Event()
+        self.events.put(("capture_hide", ready))
+        ready.wait(3)
+        try:
+            yield
+        finally:
+            self.events.put(("capture_restore", None))
+
+    def _capture_hide(self, ready):
+        windows = [self.root] + [w for w in self.root.winfo_children() if isinstance(w, tk.Toplevel)]
+        self._capture_hidden = []
+        for window in windows:
+            try:
+                if window.winfo_exists() and window.state() == "normal":
+                    window.withdraw()
+                    self._capture_hidden.append(window)
+            except tk.TclError:
+                pass
+        self.root.after(250, ready.set)             # a moment for Windows to redraw what was behind them
+
+    def _capture_restore(self):
+        for window in self._capture_hidden:
+            try:
+                if window.winfo_exists():
+                    window.deiconify()
+            except tk.TclError:
+                pass
+        self._capture_hidden = []
+
+    def _on_screen_access(self, kind, source):
+        """Main thread: always show when the screen is being looked at."""
+        if kind == "capturing":
+            self.set_status(f"Looking at {source}…")
+            self._show_screen_banner(f"Nova is looking at {source}. Nothing is saved.")
+        elif kind == "analyzing":
+            self.set_status(f"Analyzing the picture of {source} on this PC (about a minute)… Esc stops")
+            self._show_screen_banner(f"Nova is analyzing a picture of {source} on this PC. Nothing is saved.")
+        elif kind == "checking":
+            self.set_status(f"Checking {source} on screen…")
+        elif kind == "done":
+            self._schedule("screen_banner", 800, self._hide_screen_banner)
+        ui = self._agent_ui
+        if ui is not None:
+            try:
+                ui["event"]("screen", (kind, source))
+            except (tk.TclError, KeyError):
+                pass
+
+    def _show_screen_banner(self, text):
+        banner = self._screen_banner
+        if banner is None or not banner.winfo_exists():
+            banner = tk.Toplevel(self.root, bg=DANGER, padx=2, pady=2)
+            banner.overrideredirect(True)
+            banner.attributes("-topmost", True)
+            inner = tk.Frame(banner, bg=SURFACE)
+            inner.pack(fill="both", expand=True)
+            tk.Label(inner, text=Icon.VIEW, font=(self.fonts.icons, 14), bg=SURFACE, fg=DANGER).pack(side="left",
+                                                                                                  padx=(12, 6))
+            label = tk.Label(inner, text="", font=self.fonts.ui(12, semibold=True), bg=SURFACE, fg=TEXT)
+            label.pack(side="left", padx=(0, 14), pady=8)
+            banner.label = label
+            self._screen_banner = banner
+        self._jobs.pop("screen_banner", None)
+        banner.label.configure(text=text)
+        banner.update_idletasks()
+        x = (self.root.winfo_screenwidth() - banner.winfo_reqwidth()) // 2
+        banner.geometry(f"+{max(0, x)}+12")
+
+    def _hide_screen_banner(self):
+        banner, self._screen_banner = self._screen_banner, None
+        if banner is not None:
+            try:
+                banner.destroy()
+            except tk.TclError:
+                pass
+
+    def _select_region(self, answer):
+        """Main thread: a dimmed overlay over every monitor; drag to choose the area (Esc cancels)."""
+        try:
+            found = nova_vision.monitors()
+            left, top = min(m.left for m in found), min(m.top for m in found)
+            right, bottom = max(m.left + m.width for m in found), max(m.top + m.height for m in found)
+        except Exception:
+            left, top, right, bottom = 0, 0, self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        win = tk.Toplevel(self.root, bg="black")
+        win.overrideredirect(True)
+        win.attributes("-topmost", True)
+        win.attributes("-alpha", 0.35)
+        win.geometry(f"{right - left}x{bottom - top}+{left}+{top}")
+        canvas = tk.Canvas(win, bg="black", highlightthickness=0, cursor="crosshair")
+        canvas.pack(fill="both", expand=True)
+        canvas.create_text((right - left) // 2, 60, text="Drag over the area Nova should look at  ·  Esc cancels",
+                           fill="white", font=self.fonts.ui(18, semibold=True))
+        state = {}
+
+        def finish(value):
+            if state.get("done"):
+                return
+            state["done"] = True
+            try:
+                win.destroy()
+            except tk.TclError:
+                pass
+            self.root.after(150, lambda: answer.put(value))      # the overlay is gone before anything is captured
+
+        def press(event):
+            state["start"] = (event.x_root, event.y_root)
+            state["rect"] = canvas.create_rectangle(event.x, event.y, event.x, event.y, outline="#4da3ff", width=3)
+
+        def drag(event):
+            if "start" in state:
+                sx, sy = state["start"]
+                canvas.coords(state["rect"], sx - left, sy - top, event.x, event.y)
+
+        def release(event):
+            if "start" not in state:
+                return
+            (sx, sy), (ex, ey) = state["start"], (event.x_root, event.y_root)
+            box = (min(sx, ex), min(sy, ey), max(sx, ex), max(sy, ey))
+            finish(box if box[2] - box[0] >= nova_vision.MIN_SIDE and box[3] - box[1] >= nova_vision.MIN_SIDE
+                   else None)
+
+        canvas.bind("<ButtonPress-1>", press)
+        canvas.bind("<B1-Motion>", drag)
+        canvas.bind("<ButtonRelease-1>", release)
+        win.bind("<Escape>", lambda _e: finish(None))
+        win.protocol("WM_DELETE_WINDOW", lambda: finish(None))
+        win.focus_force()
+        self._region_overlay = win
+
+    def open_look_menu(self, _event=None):
+        """The Look at screen button: what to look at. Text in the message box becomes the question."""
+        if self.busy:
+            self.set_status("Wait for the current request to finish")
+            return
+        if not self.settings.get("vision_enabled", True):
+            messagebox.showinfo("Look at screen", "Screen access is switched off. Switch it on in Settings › Model › "
+                                                  "Screen.", parent=self.root)
+            return
+        menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(label="Whole screen", command=lambda: self._look_command("look at my screen"))
+        try:
+            count = len(nova_vision.monitors())
+        except Exception:
+            count = 1
+        for index in range(1, count + 1) if count > 1 else ():
+            menu.add_command(label=f"Monitor {index}", command=lambda i=index: self._look_command(f"look at monitor {i}"))
+        menu.add_command(label="Select a region…", command=lambda: self._look_command("look at a region"))
+        windows = []
+        for app in nova_desktop.POLICIES:
+            try:
+                windows += [(app, w) for w in self.desktop.windows(app)]
+            except Exception:
+                pass
+        if windows:
+            menu.add_separator()
+            for app, window in windows[:12]:
+                menu.add_command(label=f"{nova_desktop.app_title(app)} — {window.title[:60]}",
+                                 command=lambda a=app: self._look_command(f"look at the {a} window"))
+        try:
+            menu.tk_popup(self.root.winfo_pointerx(), self.root.winfo_pointery())
+        finally:
+            menu.grab_release()
+
+    def _look_command(self, command):
+        question = self.input_text.get("1.0", "end").strip()
+        if question:
+            self.input_text.delete("1.0", "end")
+            self._update_composer()
+            command += f": {question}"
+        self.append_message("user", command)
+        self.handle_user_message(command, speak=False)
+
     def _agent_event(self, kind, data):
         """Main thread: keep the agent window up to date."""
         if kind == "open":
@@ -6537,12 +7978,21 @@ class NovaGUI:
         body = ctk.CTkFrame(win, fg_color=BG)
         body.pack(fill="both", expand=True, padx=26, pady=(22, 18))
         self._dialog_header(body, "Nova agent", "Nova plans the steps, shows them before changing anything, asks "
-                                                "again before anything consequential, and checks every result.")
+                                                "again before anything consequential, and checks every result. "
+                                                f"Emergency stop: {nova_desktop.EmergencyHotkey.LABEL} or the red "
+                                                "button.")
         ctk.CTkLabel(body, text=f"“{request}”", font=f.ui(13), text_color=MUTED, anchor="w", justify="left",
                      wraplength=640).pack(fill="x", pady=(0, 8))
         status = ctk.CTkLabel(body, text="Planning…", font=f.ui(13, semibold=True), text_color=WARNING, anchor="w",
                               justify="left", wraplength=640)
-        status.pack(fill="x", pady=(0, 8))
+        status.pack(fill="x", pady=(0, 2))
+        target = ctk.CTkLabel(body, text="", font=f.ui(12), text_color=MUTED, anchor="w", justify="left",
+                              wraplength=640)
+        target.pack(fill="x", pady=(0, 2))
+        screen = ctk.CTkLabel(body, text="", font=f.ui(12), text_color=WARNING, anchor="w", justify="left",
+                              wraplength=640)                    # Step 31: when the screen is being looked at
+        screen.pack(fill="x", pady=(0, 8))
+        pending = {}                         # the question waiting for an answer, if any
         footer = ctk.CTkFrame(body, fg_color="transparent")
         footer.pack(side="bottom", fill="x", pady=(12, 0))
         rows_frame = self._scroll_list(body)
@@ -6603,6 +8053,7 @@ class NovaGUI:
                 if decided:
                     return
                 decided.append(value)
+                pending.pop("decide", None)
                 try:
                     run_button.pack_forget()
                     cancel_button.pack_forget()
@@ -6618,6 +8069,7 @@ class NovaGUI:
             run_button.pack(side="right")
             cancel_button.pack(side="right", padx=8)
             win.after(100, run_button.focus_set)
+            pending["decide"] = decide
             return decide
 
         def ask_plan(answer):
@@ -6640,6 +8092,16 @@ class NovaGUI:
                 update_row(data)
                 if data.status == "running":
                     status.configure(text=f"Running: {data.description or data.tool}", text_color=WARNING)
+                    tool = self.agent_registry.get(data.tool)
+                    where = tool.target(data.args) if tool else ""
+                    target.configure(text=f"Target: {where}" if where else "")
+            elif kind == "screen":                  # Step 31: the screen is being looked at
+                look, source = data
+                stamp = datetime.now().strftime("%H:%M:%S")
+                screen.configure(text={"capturing": f"Screen: looking at {source} (not saved)…",
+                                       "checking": f"Screen: checking {source} (not saved)…",
+                                       "analyzing": f"Screen: analyzing a picture of {source} on this PC…",
+                                       "done": f"Screen: last looked at {stamp}; nothing was saved."}.get(look, ""))
             elif kind == "replanning":
                 status.configure(text=f"{data.id} failed. Looking for another safe way…", text_color=WARNING)
             elif kind == "replanned":
@@ -6655,12 +8117,34 @@ class NovaGUI:
                                 "timed_out": ("Stopped at the time or step limit.", DANGER)}.get(
                     data.status, ("Not everything worked. See the steps above.", DANGER))
                 status.configure(text=text_, text_color=color)
+                target.configure(text="")
                 stop_button.configure(text="Close", state="normal", command=win.destroy)
+                emergency_button.pack_forget()
+
+        def emergency():
+            self.emergency_stop()            # the worker side: cancel, stop typing, close Nova's browser
+            on_emergency()
+
+        def on_emergency():
+            """The window side: answer an open question “no” and say what happened (once the task ends,
+            “done” shows the outcome)."""
+            if stop_button.cget("text") == "Close":
+                return
+            decide = pending.pop("decide", None)
+            if decide is not None:
+                decide(False)
+            status.configure(text="Emergency stop: nothing more will run. Typing and browsing stopped.",
+                             text_color=DANGER)
+            stop_button.configure(state="disabled")
 
         run_button = self._button(footer, "Run", lambda: None, width=100)
         cancel_button = self._button(footer, "Cancel", lambda: None, kind="secondary", width=100)
         stop_button = self._button(footer, "Stop", stop, kind="secondary", width=100)
         stop_button.pack(side="right")
+        emergency_button = self._button(footer, "Emergency stop", emergency, kind="danger", width=150)
+        emergency_button.pack(side="left")
+        self._button(footer, "Activity log", self.open_activity_log, kind="secondary", width=120).pack(
+            side="left", padx=8)
 
         def on_close():
             if self._agent_cancel is not None and not self._agent_cancel.is_set() and self.busy:
@@ -6668,7 +8152,7 @@ class NovaGUI:
             win.destroy()
 
         win.protocol("WM_DELETE_WINDOW", on_close)
-        self._agent_ui = {"win": win, "event": event, "ask_plan": ask_plan, "ask": ask}
+        self._agent_ui = {"win": win, "event": event, "ask_plan": ask_plan, "ask": ask, "emergency": on_emergency}
 
     # -------------------- replies: stop, progress, warm-up --------------------
     def _set_stop_mode(self, on):
@@ -6858,6 +8342,21 @@ class NovaGUI:
         self.wake_resume_event.set()
         self.voice_stop_event.set()
         SPEAKER.stop()
+        if self._agent_cancel is not None:
+            self._agent_cancel.set()
+        cancels = getattr(self, "_scheduled_cancels", None)   # Step 33: running scheduled tasks stop; they're
+        for cancel in list(cancels) if isinstance(cancels, set) else ():   # marked interrupted at the next start
+            cancel.set()                                                    # and retried if allowed
+        try:
+            self.file_watcher.stop()
+        except Exception as exc:
+            log.debug("Folder watches didn't stop cleanly: %s", exc)
+        self._stop_emergency_hotkey(shutting_down=True)
+        if self.browser is not None:
+            try:
+                self.browser.stop()          # closes Nova's browser window (its profile is discarded)
+            except Exception:
+                log.exception("Couldn't close the browser")
         close_ollama_connections()
         if getattr(self, "_http", None) is not None:
             try:
@@ -7296,6 +8795,10 @@ def main():
         initialize_context_tables()
     except sqlite3.Error as exc:
         log.error("Couldn't prepare projects and chat summaries: %s", exc)
+    try:
+        with_db(nova_schedule.ensure_schema)          # Step 33: scheduled tasks, runs, notifications (additive)
+    except sqlite3.Error as exc:
+        log.error("Couldn't prepare scheduled tasks: %s", exc)
     try:
         with_db(nova_backup.stamp_schema_version)
     except sqlite3.Error as exc:

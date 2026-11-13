@@ -48,6 +48,10 @@ MEMORY_COLUMNS = {
     "use_count": "INTEGER NOT NULL DEFAULT 0",
     "last_used_at": "TEXT",
     "reviewed_at": "TEXT",
+    # Step 32: how reliable a memory is, where it came from, and whether a newer one replaced it
+    "confidence": "TEXT NOT NULL DEFAULT 'user_stated'",     # user_stated | verified | inferred
+    "source_ref": "TEXT",                                   # e.g. "chat 12", "task run 40"
+    "superseded_by": "INTEGER",                             # a newer memory on the same subject (kept, not sent)
 }
 
 EXTRA_SCHEMA = """
@@ -71,7 +75,7 @@ CREATE TABLE IF NOT EXISTS memory_pair_reviews (
 """
 
 SELECT = ("id, category, content, created_at, updated_at, pinned, include_in_prompt, source, "
-          "use_count, last_used_at, reviewed_at")
+          "use_count, last_used_at, reviewed_at, confidence, source_ref, superseded_by")
 
 
 @dataclass
@@ -87,11 +91,15 @@ class Memory:
     use_count: int = 0
     last_used_at: str | None = None
     reviewed_at: str | None = None
+    confidence: str = "user_stated"
+    source_ref: str | None = None
+    superseded_by: int | None = None
 
 
 def _memory(row):
     return Memory(int(row[0]), str(row[1]), str(row[2]), str(row[3] or ""), str(row[4] or ""),
-                  bool(row[5]), bool(row[6]), str(row[7] or "manual"), int(row[8] or 0), row[9], row[10])
+                  bool(row[5]), bool(row[6]), str(row[7] or "manual"), int(row[8] or 0), row[9], row[10],
+                  str(row[11] or "user_stated"), row[12], row[13])
 
 
 def now():
@@ -120,6 +128,8 @@ def migrate(con, db_path=None):
     con.executescript(EXTRA_SCHEMA)
     con.execute("CREATE INDEX IF NOT EXISTS idx_memories_pinned ON memories(pinned, updated_at)")
     con.commit()
+    import nova_recall                  # Step 32's tables (work threads, blocklist, change log): additive too
+    nova_recall.ensure_schema(con)
     return missing
 
 
@@ -234,6 +244,10 @@ def validate(content, category):
         raise ValueError(f"Keep each memory under {MAX_MEMORY_CHARS:,} characters.")
     if len(category) > MAX_CATEGORY_CHARS:
         raise ValueError(f"Keep the category under {MAX_CATEGORY_CHARS} characters.")
+    import nova_recall
+    reason = nova_recall.sensitive(content)          # Step 32: secrets are never stored as memories
+    if reason:
+        raise ValueError(f"It looks like {reason}. Nova doesn't keep those in memory; use a password manager.")
     return content, category
 
 
@@ -277,6 +291,11 @@ def add_memory(con, content, category=DEFAULT_CATEGORY, pinned=False, include=Tr
     user, via a warning) decides whether they're redundant.
     """
     content, category = validate(content, category)
+    import nova_recall
+    term = nova_recall.blocked(con, f"{category} {content}")
+    if term:
+        raise ValueError(f"You asked Nova not to remember anything about “{term}”. (Change that in Memories › "
+                         "Work & privacy.)")
     timestamp = now()
     existing = find_identical(con, content)
     if existing:
@@ -289,6 +308,7 @@ def add_memory(con, content, category=DEFAULT_CATEGORY, pinned=False, include=Tr
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
             (category, content, timestamp, timestamp, int(bool(pinned)), int(bool(include)), source),
         )
+    nova_recall.log_change(con, "add", "memory", cursor.lastrowid, source)
     return SaveResult(get_memory(con, cursor.lastrowid), True)
 
 
@@ -301,6 +321,10 @@ def update_memory(con, memory_id, content=None, category=None, pinned=None, incl
                                          memory.category if category is None else category)
     changes, values = [], []
     if (new_content, new_category) != (memory.content, memory.category):
+        import nova_recall
+        term = nova_recall.blocked(con, f"{new_category} {new_content}")
+        if term:
+            raise ValueError(f"You asked Nova not to remember anything about “{term}”.")
         clash = find_identical(con, new_content, exclude_id=memory.id)
         if clash:
             raise ValueError(f"An identical memory already exists (#{clash.id}, [{clash.category}]).")
@@ -315,6 +339,8 @@ def update_memory(con, memory_id, content=None, category=None, pinned=None, incl
     if changes:
         with con:  # column names are fixed strings above; values are bound
             con.execute(f"UPDATE memories SET {', '.join(changes)} WHERE id = ?", (*values, memory.id))
+        import nova_recall
+        nova_recall.log_change(con, "edit", "memory", memory.id, "user")
     return get_memory(con, memory.id)
 
 
@@ -324,7 +350,16 @@ def delete_memory(con, memory_id):
         cursor = con.execute("DELETE FROM memories WHERE id = ?", (int(memory_id),))
         con.execute("DELETE FROM memory_pair_reviews WHERE low_id = ? OR high_id = ?",
                     (int(memory_id), int(memory_id)))
+        if _has_table(con, "memories") and "superseded_by" in {r[1] for r in con.execute("PRAGMA table_info(memories)")}:
+            con.execute("UPDATE memories SET superseded_by = NULL WHERE superseded_by = ?", (int(memory_id),))
+    if cursor.rowcount:
+        import nova_recall
+        nova_recall.log_change(con, "delete", "memory", int(memory_id), "user")
     return cursor.rowcount > 0
+
+
+def _has_table(con, name):
+    return con.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)).fetchone() is not None
 
 
 def mark_reviewed(con, memory_id):
@@ -397,7 +432,7 @@ def rank(memories, query, current=None):
     excluded from AI prompts are never ranked.
     """
     current = current or datetime.now().astimezone()
-    candidates = [m for m in memories if m.include]
+    candidates = [m for m in memories if m.include and not m.superseded_by]    # replaced facts stay, unused
     query_tokens = tokens(query)
     memory_tokens = {m.id: tokens(f"{m.category} {m.content}") for m in candidates}
     df = {}
@@ -496,7 +531,8 @@ def build_block(included):
 
 def memory_context(con, query, record=False, max_items=PROMPT_MAX_MEMORIES, max_chars=PROMPT_MAX_CHARS):
     """(block, included) for one message. record=True counts the use for each memory."""
-    ranked = select(all_memories(con), query, max_items, max_chars)
+    import nova_recall
+    ranked = select(nova_recall.usable_memories(con), query, max_items, max_chars)
     included = [r for r in ranked if r.included]
     if record and included:
         record_usage(con, [r.memory.id for r in included])
@@ -648,7 +684,10 @@ def suggest_from_message(con, text, session_id=None):
     Skips anything already saved, already pending, or previously dismissed.
     Nothing becomes a memory until the user accepts it.
     """
+    import nova_recall
     created = []
+    if nova_recall.sensitive(text) or nova_recall.blocked(con, text):
+        return created                      # Step 32: the message (kept as evidence) holds a secret or blocked topic
     for content, category in extract_suggestions(text):
         if find_identical(con, content) or find_similar(con, content, threshold=0.8):
             continue

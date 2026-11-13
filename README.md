@@ -333,6 +333,14 @@ python -m unittest discover -s tests -v
 
 The tests use temporary folders, so they never change your settings or Windows startup.
 
+The desktop and browser automation tests (`tests/test_automation.py`) use simulated apps and pages (`tests/automation_fakes.py`), so no real window, keystroke or web request is involved. Two optional tests use the real backends:
+- **Browser**: the real Playwright backend, headless, against a small site served on this PC with a fresh profile. It runs when Playwright is installed; set `NOVA_BROWSER_TESTS=0` to skip it.
+- **Desktop**: Windows UI Automation and typing against a throwaway test window. It moves the keyboard focus, so it runs only with `NOVA_DESKTOP_TESTS=1`, from a terminal in the foreground.
+
+The memory tests (`tests/test_recall.py`) build databases in the pre-Step 32 format and migrate them, corrupt and restore a database, and resume interrupted agent tasks on scratch files with a scripted model.
+
+The screen tests (`tests/test_vision.py`) use synthetic screenshots drawn by the test, a simulated capture platform and mocked image-model replies, so no real screen is captured and nothing is sent to Ollama. Two of them run the real Windows OCR on synthetic images (skipped if it isn't installed).
+
 ## Performance
 
 Nova is tuned for Windows on ARM laptops such as the Galaxy Book4 Edge (Snapdragon X, 16 GB), and runs entirely on the CPU. It doesn't need or use a discrete GPU or CUDA.
@@ -381,11 +389,228 @@ Start a message with `agent:` (or `/agent`) and Nova works out the steps itself,
 - *reversible*: needs your approval of the plan;
 - *consequential*: asks right before it runs.
 
-There are no tools for shell commands, code, installing software, purchases, sending messages, changing settings or security features, so a plan can't do those.
+There are no tools for shell commands, code, installing software, purchases, sending messages, changing settings or security features, so a plan can't do those. Apps, windows, files and web pages are covered in *Desktop and browser automation* below.
 
 **Limits** (Settings › Model › Agent): steps per request (10), retries (1), new plans after a failure (1), time per request (5 minutes). The model's planning time is limited too. **Stop** in the agent window cancels after the current step, including while the model is still planning. Only one task or agent request runs at a time.
 
 **Speed.** On this PC, `gemma3:4b` takes about 15–40 seconds to plan, plus a few seconds to write the summary. Requests Nova's own planner understands start immediately.
+
+## Desktop and browser automation
+
+The agent can also work with app windows, folders of files and web pages (`nova_desktop.py`, `nova_files.py`, `nova_browser.py`). Everything goes through the agent engine above, with the same plan approval, per-step confirmations, checks, limits and history. For example:
+
+- `agent: open notepad and type "Shopping: eggs, milk"`
+- `agent: type 12+30= in calculator`, `agent: click Seven in calculator`
+- `agent: press ctrl+s in notepad`, `agent: close notepad`
+- `agent: list the files in downloads`, `agent: organize my downloads by type`
+- `agent: open example.com and click "More information"`
+- `agent: search the web for python tutorials`
+- `agent: open wikipedia.org and type "Alan Turing" into the search box and submit`
+
+Nova's own planner handles phrases like these without the model; anything else is planned by the model with the same tools.
+
+| Tool | What it does | Safety |
+|---|---|---|
+| `list_windows`, `read_window` | Which approved apps have windows open; a window's text (Notepad's document, Calculator's display) and controls | Reads |
+| `focus_window` | Brings an app's window to the front and checks it's active | Plan approval |
+| `type_text` | Types into Notepad (any text) or Calculator (digits and operators) | Plan approval |
+| `press_keys` | An allowed shortcut: Ctrl+A/Z/Y/N/T/F, Enter, Tab, Esc, arrows… | Plan approval; **Ctrl+S, Ctrl+C/X/V and Ctrl+W ask right before** |
+| `click_control` | Presses a button, menu item, tab… found by its name (Notepad, Calculator, Paint) | Plan approval; **names like Delete, Don't save, Send, OK, and any dialog button ask right before** |
+| `close_app` | Asks a window to close, like its close button | **Asks right before** |
+| `list_folder`, `read_text_file` | A folder's files and subfolders; a text file's contents | Reads |
+| `organize_files` | Sorts a folder's files into subfolders by type, extension or month, with a preview | **Asks right before** (a bulk change) |
+| `browser_open`, `browser_read`, `browser_back`, `browser_close` | Opens a page in Nova's own browser window and reads its text, links, fields and buttons | Plan approval (an address your request didn't name asks first) |
+| `browser_click` | Clicks one link or button by its text | Plan approval; **form submissions and buttons that buy, send, delete, post or change something ask right before** |
+| `browser_type` | Fills one ordinary field | Plan approval; **submitting asks right before** |
+| `browser_search` | Searches with DuckDuckGo (default), Bing or Google | **Asks right before**, showing the query |
+
+Opening apps, websites and folders, and searching, copying, moving, renaming or recycling single files, are the task actions described in *Files, apps and the clipboard*.
+
+**Apps.** Only Notepad, Calculator, Paint, VS Code, File Explorer and your browser, recognized by their program file, never by window title alone. Typing works only in Notepad and Calculator, and clicking only in Notepad, Calculator and Paint. VS Code's terminal runs commands, File Explorer can change files outside your allowed folders, and web pages have their own tools. Before every action Nova checks that the window exists, that no unexpected dialog is open (it stops and tells you the dialog's title and buttons), and that the window is the active one. Windows' focus rules are never worked around: if Windows won't bring a window to the front, Nova says so. Typing checks the focus again every few characters and stops at once if another window becomes active or a Ctrl, Shift, Alt or Windows key is held down. Text that looks like a password or key is never typed. Controls are found by name through Windows UI Automation and must be enabled and on screen. A mouse click is only a fallback, after checking that exactly that control is at that point; coordinates are never replayed. `close_app` never kills a program. If the app asks about unsaved changes, Nova leaves the question to you.
+
+**Checks.** Typed text is read back from the text box, the active window is read from Windows, a closed window must be gone, and saved documents must lose their unsaved-changes mark. Where Nova can't observe the effect (for example Ctrl+Z), the step says so.
+
+**Files.** The same path rules as tasks: full local paths only; no `..`, links, junctions, network paths, protected folders or key files. Reading needs an allowed folder or Downloads/Documents/Desktop/Pictures, and changing needs an allowed folder (Nova asks otherwise). `organize_files` moves exactly the files shown in its preview and never replaces a file. It leaves subfolders, programs and scripts, hidden files, unfinished downloads and Office lock files where they are, re-checks each file right before moving it, and stops at once when you stop the task.
+
+**Browser** (off by default: **Settings › Model › Agent › Browser automation**; needs `pip install playwright`, then uses Microsoft Edge or Chrome on this PC). Nova's browser is a separate, fresh profile in its own window. Your cookies, saved passwords and signed-in sessions aren't available to it, and it's discarded when closed. It opens only http and https addresses, never local or private network addresses (your router, other PCs), and checks the address again whenever the page changes (a link, a form or a redirect). If the page lands on an address Nova doesn't allow, Nova leaves it. Downloads are refused, links that start an email or call are refused, and site permission requests (location, camera, notifications) are denied. **Sign-in pages and CAPTCHAs are never filled in or solved.** Nova asks you to do it yourself in its browser window and continues when you click **Continue** (or stops). It never types into password, payment or verification-code fields. Page text is treated as data: instructions planted in pages are removed before the model sees it, and it isn't stored.
+
+**The record.** Typed text and form entries are stored in **Tasks** only as their length. The **Activity log** (a button in the agent window) lists every change agent tasks made or tried, newest first. That includes each file `organize_files` moved, apps typed into or closed, and pages opened or forms submitted, with the outcome and how it was checked. Contents are never recorded.
+
+**Stopping.** **Stop** in the agent window stops after the current step. **Emergency stop** (the red button, or **Ctrl+Alt+Backspace** anywhere in Windows while a task runs) stops at once. Typing stops between two characters, waits end, Nova's browser window is closed, and an open question is answered *No*. Automation runs on background threads, so the window stays responsive.
+
+**Settings › Model › Agent:** *Control apps on this PC* (on by default) and *Browser automation* (off by default).
+
+**Limitations.**
+- Windows only lets Nova bring a window to the front while Nova itself is in the foreground (for example right after you click **Run**). If you switch to another app mid-task, a later step may stop with “Windows didn't let Nova bring … to the front”.
+- Apps that don't support UI Automation well (some games, custom-drawn or Tk windows) expose few named controls, so `click_control` can't find their buttons; typing still works where the text box has focus.
+- Typing into apps running as administrator is blocked by Windows.
+- An emergency stop during a slow page load ends the browser within that operation's time limit (up to about 20 seconds).
+- Web searches can run into a search engine's robot check; Nova then asks you to solve it yourself.
+- Search result layouts change. If Nova can't read a results page, it falls back to the page's links.
+
+## Looking at the screen
+
+Nova can look at your screen when you ask, read it, and explain what it sees: text, dialogs, errors and window layouts (`nova_vision.py`). For example:
+
+- `look at my screen`, `what's on my screen?`, or say “Hey Nova, look at my screen” (hands-free)
+- `look at my screen: why does this error appear?` (the part after the colon is your question)
+- `look at monitor 2`, `look at a region` (drag over the area), `look at the notepad window`
+- **Look at screen** in the sidebar: choose the whole screen, a monitor, a region or an open app window. Text in the message box becomes the question.
+- `agent: look at my screen and tell me which button to press`, `agent: check that notepad shows Saved`
+
+The reply starts with the answer, then a short **What Nova looked at** section:
+- **Read on screen**: text recognized by Windows OCR, quoted.
+- **Controls**: names from Windows UI Automation, for app windows.
+- **Confirmed by the screen text**: dialogs and errors the image model reported that OCR also read.
+- **Reported by the model but not found in the screen text**: possible misreadings, marked as such.
+- **Interpreted by** *model*: what the model concluded, labeled as inference.
+
+**How it works.**
+1. **Capture.** One picture of what you asked for. Nova's own windows step aside for a moment, so you get what's behind them. App windows are captured even when other windows cover them. Nothing is recorded continuously.
+2. **Privacy masking** happens before anything reads the picture:
+   - Nova's own windows are blacked out.
+   - So are windows of excluded apps. By default these are KeePass, 1Password, Bitwarden, LastPass, Dashlane, Keeper, Credential Manager, Windows Security and any window with “Password” in its title; you can change the list in Settings.
+   - Password fields are always blacked out.
+3. **Text.** Windows' built-in OCR reads the text on this PC, in well under a second. Small captures are enlarged first.
+4. **Understanding.** A local Ollama model reads the picture, but only if Ollama itself reports that the model has the `vision` capability. Nova checks that; it never assumes. Nova uses the chat model if it qualifies, otherwise any installed model that does, or the one chosen in Settings. `gemma3:4b` qualifies.
+5. **Without an image model**, or if it fails or times out, Nova answers from the screen text alone with the text model, and says so.
+
+**Speed** (this PC, `gemma3:4b`, CPU only): about 40–60 seconds per picture with the image model; image size makes little difference, because the model resizes every picture. Capture, masking and OCR take well under a second. **Esc** or the stop button cancels.
+
+**During app automation** (Step 30), the agent takes a quick, fresh look at the app's window before typing, clicking or pressing keys:
+- If the window shows a message that Windows' accessibility interface didn't report, such as “Do you want to save changes?”, “Access is denied” or an error banner, the step stops and quotes it. Text inside the document you're editing doesn't count.
+- After consequential steps (saving, closing a tab, answering a dialog, risky buttons), it looks again. A save is reported as failed if the window then shows an error.
+- These checks use OCR and UI Automation only, never the slow image model.
+- Every check uses a new picture; earlier screenshots are never reused. Clicks still find controls by name through UI Automation, never by coordinates read from a picture.
+
+**Privacy.**
+- Screenshots exist only in memory while they're analyzed. They're never written to disk, the database or the log; only the reply text is kept.
+- They go only to the Ollama server on this PC. If `OLLAMA_HOST` points to another computer, Nova sends screenshots there only if you switch that on in Settings; otherwise it uses the screen text instead.
+- A banner at the top of the screen shows whenever Nova is looking, and the agent window shows when a step checked the screen.
+- Every look you or an agent step asks for is listed in the **Activity log**, recording what was looked at but never its contents. The quick automation checks are shown in the agent window instead.
+- Text on screen is treated as data: instructions planted in it are removed before a model sees it as part of a task.
+
+**Settings › Model › Screen**:
+- *Let Nova look at the screen* (on)
+- *Check app windows during automation* (on)
+- *Read screen text* (on; needs the `winrt-…` packages)
+- *Understand pictures with a local image model* (on; the card shows which installed model qualifies)
+- *Always hidden* (the exclusion list)
+
+**Limitations.**
+- OCR can misread small or stylized text, for example “0K” for “OK”. Nova quotes what it read, so you can judge.
+- Some windows can't be captured: protected video, apps running as administrator, or minimized windows. Nova then says the picture was blank or the window inaccessible.
+- The quick checks recognize common message wording in English. A dialog with unusual wording, or one drawn without text, may not be caught by them, though Windows' own dialog detection still applies.
+- With several monitors at different scaling, region selection follows Windows' coordinates; if a selection is slightly off, use a whole monitor instead.
+
+## Work memory and continuing work
+
+Nova remembers ongoing work across sessions: decisions, what's done, blockers and next steps. It recalls them when they're relevant, and can pick up where you left off (`nova_recall.py`). For example:
+
+- `decision: keep the memory in SQLite`, `next: write the migration tests`, `blocker: waiting for the API key`, `done: added the OCR module`. Add a topic in brackets, e.g. `next (NOVA development): …`. Without one, the entry goes under the chat's project, or *General*.
+- `what's the status of NOVA development?`
+- `continue the NOVA development from yesterday`, `pick up where we left off`
+- `don't remember anything about my health`, and later `you can remember my health again`
+
+**What's kept, and how reliable it is.** Every recalled item is labeled with its reliability, so a guess is never presented as a fact:
+
+| Kind | Where it lives | Reliability |
+|---|---|---|
+| Facts and preferences you approved | Memories (as before) | *you said* |
+| Decisions, next steps, blockers you recorded | Work memory | *you said* |
+| What agent tasks did, with how each result was checked | Work memory and Tasks | *verified* |
+| Summaries of earlier chats | Written by the model (as before) | *inferred, may be wrong* |
+
+Anything Nova records automatically is listed with its source, such as a task run or a chat. When an agent task is stopped or fails, its remaining steps and failures are kept as temporary task context, separate from lasting memory. They're used for 30 days, then marked expired (kept, not deleted).
+
+**Retrieval.** For each message and before each agent plan, Nova searches memories, work notes, earlier chats' summaries and the task history by keyword. Words are reduced to their stems and rarer words count more. Results are ranked by relevance × reliability, then how recent they are, and items from the time you mention (“yesterday”, “last week”) rank higher. Only a few items within a small budget are sent, and nothing is added when nothing matches, so the whole database never goes into a prompt. Local embeddings (vector search) were considered and not used: the installed model has no embedding capability, and keyword search finds what's asked for in a personal collection of this size.
+
+**Continuing work.** “Continue …” finds the matching topic (or the most recent one) and checks its open steps against what Nova actually did before anything runs:
+- A step that was done since, by any later task, is closed, not repeated.
+- A step whose files or apps no longer fit (a file was deleted, a folder moved) is reported and not run.
+- A step that needed text Nova never stores, such as a file's contents, is listed for you to redo.
+- The remaining steps become a plan you approve like any other.
+- If nothing can be resumed, Nova shows the verified state (decided, done, blockers, still to do) and runs nothing.
+
+**Conflicting facts.** If you save “My favourite colour is green” after “… is blue”, the newer one is used. The older one is kept and marked *replaced*. **Memories › Work & privacy** lists conflicts with **Use the newer** / **Keep both**, and lets you use a replaced fact again.
+
+**Privacy.**
+- Everything stays in `nova_memory.db` on this PC.
+- Passwords, PINs, keys, tokens, card numbers and ID or bank numbers are never stored as memories or work notes; Nova refuses before asking to save them. Memory suggestions skip messages that contain them.
+- Topics on the *don't remember* list are refused for every kind of memory and never recalled. Existing items that mention a topic are kept (no longer used) until you delete them: **Delete what mentions it…**. Chats aren't affected.
+- Text typed by tasks and file contents are never stored, only their length.
+- Every memory change (add, edit, delete, replace, block, export) is listed in **Change log**, without its contents.
+
+**Memories › Work & privacy**:
+- Each topic with its entries and their reliability and source, with **Resolve** / **Reopen**, **Correct** and **Delete**; whole topics can be renamed, marked done or deleted.
+- Conflicting and replaced facts.
+- The don't-remember list.
+- **Export…**: all memories and work notes as JSON. Chats aren't included.
+- **Change log**.
+- Switches: *Recall work and earlier chats* and *Keep what agent tasks did* (both on).
+
+**Upgrading.** Nova upgrades the database by itself at start-up (schema version 25):
+- It backs the database up first, as earlier upgrades did.
+- It adds three columns to the memories table (`confidence`, `source_ref`, `superseded_by`, with defaults) and four tables (`work_threads`, `work_entries`, `memory_blocklist`, `memory_changes`).
+- Nothing is dropped, rewritten or deleted, and existing memories keep their text, dates, pins and settings.
+
+To check or upgrade a database by hand:
+
+```powershell
+python tools\migrate_memory.py --check     # what would change; changes nothing
+python tools\migrate_memory.py             # backup to backups\pre-memory-upgrade-<time>.db, upgrade, verify
+```
+
+A damaged database is never changed: restore a backup, or let Nova set it aside at start-up (see *Backups, recovery and diagnostics*). Backups made before this version can still be restored; Nova upgrades them when it next starts.
+
+## Automations: scheduled tasks, watches and notifications
+
+Nova can run checks on a schedule and react to events you set up, without a new command each time (`nova_schedule.py`). Open **Automations** in the sidebar or the tray menu, or type:
+
+- `schedule every weekday at 9am: find invoices in downloads`
+- `schedule tomorrow at 18:00: remind me to back up the laptop` (a notification only)
+- `watch downloads for pdf` (notify when new PDFs arrive), `watch downloads for pdf: read_document {files}`
+- `notify me when notepad closes`
+- `list my automations`
+
+A chat command only opens the editor, filled in: nothing is scheduled until you save it there.
+
+**Triggers.**
+
+| Trigger | Details | Cost |
+|---|---|---|
+| Time | Once, or repeating: daily, weekdays, weekly on chosen days, monthly (a day or the last day), or every N minutes (at least 5) | Checked in Nova's existing reminder check |
+| Files | New, changed or deleted files matching a pattern in a folder (only directly in it; unfinished downloads ignored) | Windows reports changes, so nothing is polled; at most one run a minute per watch |
+| App | Notepad, Calculator, Paint, VS Code, File Explorer or the browser opens or closes | A window check every 15 s, only while such a watch exists |
+| Web page | The text of one https page you name changes | Only if online integrations are on; at most hourly; conditional requests; no local or private addresses |
+
+**What happens.** Either a notification with your text, or a request Nova carries out with the agent: same tools, rules, limits, task history, activity log and memory as a typed `agent:` request. For an agent task, **Check the plan…** plans it once without running anything. You approve the tools and folders it may use, and the most consequential kind of step allowed. A later run whose plan needs another tool, a riskier step or another folder doesn't run: it's marked *needs review* and notifies you. Consequential steps still ask right before, every time; Nova comes to the front for that, and no answer within 10 minutes means no. Changing an agent task's request needs its plan approved again. A scheduled task can't choose files in a dialog.
+
+**Reliability.**
+- *One scheduler.* Scheduled tasks share the reminder engine: the same repeat rules, the same local wall-clock times (9 AM stays 9 AM across daylight-saving changes), and the same check every 2 seconds.
+- *Exactly once.* Each run is claimed with a conditional update and a unique record per task, time and attempt, so a restart or a second Nova window never runs anything twice.
+- *Missed runs.* If Nova was closed, the PC asleep or off, a repeating task runs once for all its missed times (“missed 3 times; ran once now”), or skips them if the task is set to *skip*. Anything later than the task's missed-run window (12 hours) is skipped and you're told.
+- *Restarts.* A run that was going when Nova closed is marked *interrupted* at the next start and retried within the task's retry limit.
+- *Retries.* A failed run is retried after 10 minutes, up to the task's limit (0–3). Each failure is notified with the reason and when Nova will try again.
+- *Busy.* If another task is running, a scheduled run waits 2 minutes and tries again; the wait doesn't count as an attempt.
+- *Times.* Every run records its local time, the time zone (e.g. “India Standard Time, UTC+05:30”) and UTC. If you change the PC's time zone, schedules follow the new local time.
+
+**Notifications** say what happened, when, and why: the triggering condition, such as “Scheduled for today at 9:00 AM”, “Files changed in Downloads: invoice.pdf (created)” or “Retry 1 of 1”.
+- They appear as Windows notifications through Nova's tray icon. A pop-up also appears for problems, while Nova's window is open, or when the tray isn't available. They can also be spoken (per task).
+- Per task, choose *always*, *failures only* or *never*. Needs-review notices are always shown.
+- **Quiet hours** (e.g. 22:00–07:00) keep new notifications silent in the inbox and deliver them when quiet hours end.
+- **Automations › Notifications** lists them: **Mark read**, **Snooze 1 h**, **Dismiss**, and **Inspect** from the pop-up.
+
+**Managing.** **Automations** lists each task with its trigger, what it may do, its next run and its last run (status and error). From there you can **Run now**, **Pause**, **Resume**, **Edit**, **Delete** or view **History**. Resuming a paused repeating task continues from its next future time; it doesn't catch up. **Run scheduled tasks and watches** (also in the tray menu) pauses everything at once.
+
+**Background.** Automations run while Nova is open or in the tray, and stop when Nova exits. Running tasks are cancelled and retried at the next start if allowed. Nova doesn't wake the PC or run while it's closed.
+
+**Limitations.**
+- Nothing runs while Nova isn't running or the PC is asleep; missed runs follow the task's policy when Nova is next running.
+- Folder watches see files directly in the folder (not subfolders), up to 2,000 files, and at most 60 folders.
+- App watches recognize only the apps above, by their windows.
+- Web-page watches compare the page's text, so pages that change on every visit (ads, timestamps) report changes often, and pages built by scripts may look unchanged.
+- The tray notification shows briefly; the inbox keeps everything.
 
 ## Hands-free voice
 

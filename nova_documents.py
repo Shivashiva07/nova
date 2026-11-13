@@ -17,9 +17,9 @@ from __future__ import annotations
 import csv
 import hashlib
 import io
+import json
 import logging
 import os
-import pickle
 import posixpath
 import queue
 import re
@@ -596,7 +596,7 @@ def build_chunks(sections, size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
             if total + len(content) > MAX_TEXT_CHARS:
                 note = f"Only the first {MAX_TEXT_CHARS:,} characters were indexed."
                 return chunks, note
-            key = hashlib.sha1(" ".join(content.split()).lower().encode("utf-8")).hexdigest()
+            key = hashlib.sha1(" ".join(content.split()).lower().encode("utf-8"), usedforsecurity=False).hexdigest()
             if key in seen:
                 continue
             seen.add(key)
@@ -1307,8 +1307,30 @@ def isolate_extraction(path, size):
     return Path(path).suffix.lower() in (".pdf", ".docx", ".xlsx") or size > ISOLATE_TEXT_BYTES
 
 
+MAX_MESSAGE_BYTES = 64 * 1024 * 1024
+
+
+def _to_wire(obj):
+    if isinstance(obj, Chunk):
+        return {"__chunk__": [obj.index, obj.content, obj.location, obj.page, obj.sheet]}
+    if isinstance(obj, (list, tuple)):
+        return [_to_wire(item) for item in obj]
+    return obj
+
+
+def _from_wire(obj):
+    if isinstance(obj, dict) and set(obj) == {"__chunk__"}:
+        index, content, location, page, sheet = obj["__chunk__"]
+        return Chunk(int(index), str(content), location, page, sheet)
+    if isinstance(obj, list):
+        return [_from_wire(item) for item in obj]
+    return obj
+
+
 def _send(stream, obj):
-    data = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
+    """One message to or from the reader process, as length-prefixed JSON. (Step 34: not pickle, so data from a
+    process that parses untrusted documents can never become code in Nova.)"""
+    data = json.dumps(_to_wire(obj), ensure_ascii=False).encode("utf-8")
     stream.write(struct.pack("<I", len(data)) + data)
     stream.flush()
 
@@ -1322,7 +1344,13 @@ def _recv(stream):
                 raise EOFError("the worker closed its pipe")
             buffer += part
         return buffer
-    return pickle.loads(exactly(struct.unpack("<I", exactly(4))[0]))
+    size = struct.unpack("<I", exactly(4))[0]
+    if size > MAX_MESSAGE_BYTES:
+        raise EOFError("the reader sent an oversized message")
+    try:
+        return _from_wire(json.loads(exactly(size).decode("utf-8")))
+    except (UnicodeDecodeError, ValueError, TypeError) as exc:
+        raise EOFError(f"the reader sent an unreadable message ({type(exc).__name__})") from None
 
 
 def serve_extraction():
@@ -1389,7 +1417,7 @@ class ExtractionWorker:
         try:
             _send(process.stdin, str(path))
             reply = _recv(process.stdout)
-        except (OSError, EOFError, pickle.UnpicklingError, struct.error):
+        except (OSError, EOFError, struct.error):
             reply = None
         finally:
             done.set()

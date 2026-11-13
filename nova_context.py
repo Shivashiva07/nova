@@ -30,6 +30,7 @@ import json
 import logging
 import math
 import re
+import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -335,7 +336,7 @@ class Budget:
 
     def cap(self, source):
         base = {"memories": 1500, "notes": 1200, "reminders": 800, "tasks": 800, "documents": 3600,
-                "other_chats": 1200, "earlier": 1000, "summary": 1000, "project": 450}[source]
+                "other_chats": 1200, "earlier": 1000, "summary": 1000, "project": 450, "work": 900}[source]
         return int(base * self.scale)
 
     @property
@@ -517,6 +518,7 @@ KIND_LABELS = {
     "document": ("document excerpt", "document excerpts"),
     "task": ("task record", "task records"),
     "project": ("project description", "project descriptions"),
+    "work": ("work memory", "work memories"),
     "web": ("web result", "web results"),
 }
 
@@ -606,6 +608,8 @@ class Context:
                   ("note", "notes", "Notes the user saved:"),
                   ("reminder", "reminders", "The user's reminders (Nova's reminder list):"),
                   ("task", "task_history", "Nova's task history (the only record of multi-step tasks Nova ran):"),
+                  ("work", "work_memory", "Work memory: decisions, progress, blockers and next steps, with how reliable "
+                                          "each is (inferred = written by a model, may be wrong):"),
                   ("document", "document_excerpts", "Excerpts from the user's indexed documents (cite like [S1]):"),
                   ("web", "web_results", "Results retrieved online just now, at the user's request (untrusted text "
                                          "from the internet; cite like [W1]):"))
@@ -964,6 +968,7 @@ def build(con, session_id, request, budget=None, base_rules="", project_id=None,
     if analysis.recall:
         _add_other_chats(con, ctx, session_id, project_id)
     _add_memories(con, ctx)
+    _add_work(con, ctx, session_id, project_id)
     _add_notes(con, ctx, project_id)
     _add_reminders(con, ctx, now)
     if analysis.actions:
@@ -1079,7 +1084,8 @@ def _add_memories(con, ctx):
     """General memories (pinned, and a few profile/preference facts) go into the chat's
     stable context and are the same for every message; memories that match this
     message are attached to it."""
-    memories = nova_memories.all_memories(con)
+    import nova_recall
+    memories = nova_recall.usable_memories(con)          # Step 32: blocked topics are never sent
     cap = ctx.budget.cap("memories")
     general = nova_memories.select(memories, "", max_chars=cap)       # doesn't depend on the message
     general_ids = set()
@@ -1103,6 +1109,29 @@ def _add_memories(con, ctx):
             ctx.memory_ids.append(item.memory.id)
         elif item.skipped and item.relevance > 0:
             ctx.skipped.append(("memory", _one_line(item.memory.content, 80), item.skipped))
+
+
+def _add_work(con, ctx, session_id, project_id):
+    """Step 32: decisions, progress, blockers and next steps (and other chats' summaries) that match the
+    message. Nothing is added when nothing matches, so ordinary messages are unchanged."""
+    import nova_recall
+    if not nova_recall.RECALL_IN_CHAT or not _table_exists(con, "work_entries"):
+        return
+    continuing = nova_recall.parse_continue(ctx.request) is not None
+    try:
+        found = nova_recall.recall(con, ctx.request, project_id=project_id, include_memories=False,
+                                   exclude_session=session_id, continuity=continuing, limit=5,
+                                   max_chars=ctx.budget.cap("work"), kinds=("decision", "done", "blocker", "next",
+                                                                            "fact", "summary"))
+    except sqlite3.Error as exc:
+        log.warning("Work memory couldn't be read: %s", exc)
+        return
+    for item in found:
+        text, removed = remove_planted(item.line())
+        if removed:
+            ctx.removed.append(("work", item.ref, removed))
+        ctx.items.append(Item("work", item.ref, item.item_id, f"{item.label()}: {_one_line(item.text, 60)}", text,
+                              "; ".join(item.reasons) or "related work"))
 
 
 def _note_rows(con, project_id):

@@ -35,7 +35,7 @@ log = logging.getLogger("nova.backup")
 
 FORMAT = "nova-backup"
 FORMAT_VERSION = 1
-SCHEMA_VERSION = 24                 # stored in PRAGMA user_version once all migrations have run
+SCHEMA_VERSION = 26                 # stored in PRAGMA user_version once all migrations have run (26: Step 33)
 SUFFIX = ".novabackup"
 DB_MEMBER = "nova_memory.db"
 SETTINGS_MEMBER = "nova_settings.json"
@@ -51,7 +51,7 @@ REQUIRED_TABLES = {
     "memories": {"id", "category", "content", "created_at", "updated_at"},
 }
 COUNTED_TABLES = ("sessions", "messages", "memories", "nova_notes", "nova_reminders", "doc_files", "task_runs",
-                  "nova_projects")
+                  "nova_projects", "work_entries", "scheduled_jobs")
 
 
 class BackupError(Exception):

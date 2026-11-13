@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import tempfile
 from datetime import datetime
@@ -60,6 +61,29 @@ DEFAULTS = {
     "agent_max_replans": 1,      # new plans after a step fails
     "agent_time_limit": 300,     # seconds a request may take in total
     "agent_model_timeout": 120,  # seconds to wait for the model to plan or answer
+    # Desktop and browser automation (Step 30)
+    "desktop_automation": True,  # the agent may focus, read, type into, click in and close approved apps
+    "browser_automation": False,  # the agent may drive its own browser window (needs Playwright); off by default
+    # Security and autonomy controls (Step 34).
+    "tasks_paused": False,          # nothing new starts (typed, spoken, agent, task: or scheduled) until resumed
+    "approval_ttl_minutes": 10,     # a plan approval covers changes for this long; later changes ask again
+    # Scheduled tasks, watches and notifications (Step 33).
+    "automation_enabled": True,     # run scheduled tasks and watches (each one is created and approved by you)
+    "quiet_hours_enabled": False,   # hold back sound, speech and pop-ups between quiet_start and quiet_end
+    "quiet_start": "22:00",
+    "quiet_end": "07:00",
+    # Memory and context retrieval (Step 32). Everything stays in nova_memory.db on this PC.
+    "memory_recall_enabled": True,   # recall decisions, progress, blockers and other chats' summaries when relevant
+    "memory_record_outcomes": True,  # keep what agent tasks verifiably did (and what's left) for next time
+    # Visual awareness (Step 31). Screenshots stay in memory on this PC and are never saved.
+    "vision_enabled": True,      # Nova may look at the screen when you ask (or an approved agent step needs to)
+    "vision_agent_checks": True,  # a quick look at an app's window before typing/clicking and after consequential steps
+    "vision_ocr": True,          # read screen text with Windows' built-in OCR
+    "vision_use_model": True,    # let a local image model (Ollama, “vision” capability) interpret screenshots
+    "vision_model": None,        # None: the chat model if it can read images, else any installed one that can
+    "vision_allow_remote": False,  # send screenshots to an Ollama server on another computer (off: never)
+    "vision_exclusions": ["KeePass", "1Password", "Bitwarden", "LastPass", "Dashlane", "Keeper",
+                          "Credential Manager", "Windows Security", "Password"],   # windows always blacked out
     # Hands-free voice (Step 29). Wake-word detection is always local (Vosk); audio is never saved.
     "wake_phrase": "hey nova",   # 1–4 words the local wake-word model knows
     "wake_sensitivity": "medium",  # low | medium | high: how readily the wake phrase is accepted
@@ -72,7 +96,7 @@ DEFAULTS = {
     "voice_max_utterance": 20,   # longest spoken request, in seconds
 }
 AGENT_LIMITS = {"agent_max_steps": (1, 25), "agent_max_retries": (0, 3), "agent_max_replans": (0, 3),
-                "agent_time_limit": (30, 1800), "agent_model_timeout": (20, 600)}
+                "agent_time_limit": (30, 1800), "agent_model_timeout": (20, 600), "approval_ttl_minutes": (1, 120)}
 VOICE_LIMITS = {"voice_listen_timeout": (2, 30), "voice_end_silence": (0.5, 4.0), "voice_max_utterance": (5, 60)}
 WAKE_SENSITIVITY_CHOICES = ("low", "medium", "high")
 VOICE_ROUTE_CHOICES = ("agent", "chat")
@@ -244,10 +268,27 @@ def validate_settings(raw):
             warnings.append("'online_providers' must map provider names to true or false; using the defaults.")
     for key in ("minimize_to_tray", "wake_word_enabled", "memory_suggestions_enabled", "log_performance",
                 "summarize_long_chats", "online_enabled", "online_confirm", "voice_barge_in", "voice_wake_sound",
-                "voice_confirm_transcript"):
+                "voice_confirm_transcript", "desktop_automation", "browser_automation", "vision_enabled",
+                "vision_agent_checks", "vision_ocr", "vision_use_model", "vision_allow_remote",
+                "memory_recall_enabled", "memory_record_outcomes", "automation_enabled", "quiet_hours_enabled",
+                "tasks_paused"):
         if key in raw:
             clean[key] = _as_bool(key, raw[key], warnings)
-    for key in ("ollama_model", "tts_voice", "microphone_name", "microphone_hostapi"):
+    for key in ("quiet_start", "quiet_end"):
+        if key in raw:
+            value = str(raw[key] or "").strip()
+            if re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", value):
+                clean[key] = value
+            else:
+                warnings.append(f"'{key}' must be a time like 22:00; using the default.")
+    if "vision_exclusions" in raw:
+        value = raw["vision_exclusions"]
+        if isinstance(value, list) and all(isinstance(v, str) for v in value):
+            words = [" ".join(v.split())[:60] for v in value if v.strip() and not any(ord(c) < 32 for c in v)]
+            clean["vision_exclusions"] = list(dict.fromkeys(words))[:40]
+        else:
+            warnings.append("'vision_exclusions' must be a list of app or window names; using the defaults.")
+    for key in ("ollama_model", "tts_voice", "microphone_name", "microphone_hostapi", "vision_model"):
         if key in raw:
             clean[key] = _as_text(key, raw[key], warnings)
     for key, (low, high) in AGENT_LIMITS.items():

@@ -22,6 +22,26 @@ vosk==0.3.41
 # are read with the standard library. Without pypdf, PDFs are reported as needing it.
 pypdf==7.0.0
 
+# Desktop automation for the agent: Windows UI Automation (also needed by pyttsx3)
+comtypes==1.4.17
+
+# Optional: browser automation for the agent (Settings › Model › Agent › Browser automation).
+# Uses Microsoft Edge or Google Chrome already on this PC, so no browser download is needed.
+# Without it, the browser tools are simply unavailable.
+playwright==1.64.1
+
+# Optional: reading screen text for "look at my screen" (Windows' built-in OCR, on this PC).
+# Without these, Nova still understands screenshots with an image model, or reads window text via UI Automation.
+winrt-runtime==3.2.1
+winrt-Windows.Foundation==3.2.1
+winrt-Windows.Foundation.Collections==3.2.1
+winrt-Windows.Globalization==3.2.1
+winrt-Windows.Graphics.Imaging==3.2.1
+winrt-Windows.Media.Ocr==3.2.1
+winrt-Windows.Storage.Streams==3.2.1
+# Window screenshots (PrintWindow); also needed by pyttsx3
+pywin32==312
+
 # Optional: system tray icon (Nova runs without these)
 pystray==0.19.5
 pillow==12.3.0

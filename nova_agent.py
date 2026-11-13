@@ -38,6 +38,7 @@ import logging
 import os
 import queue
 import re
+import sqlite3
 import threading
 import time
 from dataclasses import dataclass, field
@@ -192,6 +193,12 @@ class Env:
     approved: set = field(default_factory=set)
     project_id: int | None = None
     online: object = None              # (http, secrets) for the online tool, or None
+    # Step 30 (optional): desktop and browser automation, and asking the user to step in
+    desktop: object = None             # nova_desktop backend (windows, UI Automation, keyboard), or None
+    browser: object = None             # nova_browser session, or None
+    intervene: object = None           # (message) -> True once the user has done it (e.g. signed in), else False
+    run_id: int | None = None          # the task history run, for the audit trail
+    vision: object = None              # Step 31: nova_vision.ScreenAnalyzer (looking at the screen), or None
 
 
 class Tool:
@@ -203,9 +210,18 @@ class Tool:
     safety = READ_ONLY
     timeout = 10.0
     retry_on_timeout = False
+    private = frozenset()              # arguments never stored in the task history (typed text, …)
 
     def available(self, env):
         return True, ""
+
+    def offer(self, request):
+        """Whether to show this tool to the planner for this request (fewer tools plan faster)."""
+        return True
+
+    def target(self, args):
+        """What the step acts on, shown in the agent window (an app, a web page, a folder)."""
+        return ""
 
     def prepare(self, args, env, trusted=False):
         return Prepared(args, self.title, self.safety)
@@ -645,7 +661,62 @@ def default_registry():
     for tool in (FindMemories(), FindNotes(), ListReminders(), SearchDocuments(), SearchChats(), CurrentTime(),
                  OnlineLookup()):
         registry.register(tool)
+    # Step 30: desktop, file and browser automation (imported here: those modules build on this one)
+    import nova_browser
+    import nova_desktop
+    import nova_files
+    for module in (nova_desktop, nova_files, nova_browser):
+        for tool in module.tools():
+            registry.register(tool)
+    import nova_vision                     # Step 31: looking at the screen
+    for tool in nova_vision.tools():
+        registry.register(tool)
+    nova_vision.register_rules()
     return registry
+
+
+# ==================== audit trail (Step 30) ====================
+AUDIT_SCHEMA = """
+CREATE TABLE IF NOT EXISTS automation_audit (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    at TEXT NOT NULL,
+    run_id INTEGER,
+    tool TEXT NOT NULL,
+    operation TEXT NOT NULL,
+    target TEXT,
+    outcome TEXT NOT NULL,
+    detail TEXT
+);
+CREATE INDEX IF NOT EXISTS automation_audit_at ON automation_audit(at);
+"""
+
+
+def record_audit(connect, run_id, tool, operation, target, outcome, detail=None):
+    """One line in the audit trail of changes made by the agent (paths, apps, pages; never contents).
+    Never raises: a failing audit write is logged, it doesn't break the task."""
+    if connect is None:
+        return
+    try:
+        con = connect()
+        try:
+            with con:
+                con.executescript(AUDIT_SCHEMA)
+                from nova_system import redact        # Step 34: no secrets in the audit trail either
+                con.execute("INSERT INTO automation_audit (at, run_id, tool, operation, target, outcome, detail) "
+                            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                            (_now(), run_id, tool, redact(operation, 300), redact(target, 1000) if target else None,
+                             outcome, redact(detail, 500) if detail else None))
+        finally:
+            con.close()
+    except Exception as exc:
+        log.warning("Couldn't write the audit trail: %s", exc)
+
+
+def list_audit(con, limit=200):
+    con.executescript(AUDIT_SCHEMA)
+    rows = con.execute("SELECT at, run_id, tool, operation, target, outcome, detail FROM automation_audit "
+                       "ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+    return [dict(zip(("at", "run_id", "tool", "operation", "target", "outcome", "detail"), r)) for r in rows]
 
 
 # ==================== plans ====================
@@ -711,6 +782,22 @@ def _mentions(request, *words):
     return any(w and re.search(rf"(?<!\w){re.escape(w.lower())}(?!\w)", text) for w in words)
 
 
+# Step 30 hooks, filled in by the automation modules:
+APP_TOOLS = set()        # tools whose "app" must be named in the request (besides open_app and switch_app)
+ARG_GUARDS = {}          # tool -> [(argument, pattern the request must match, note)]: turned off otherwise
+PRIVATE_ARGS = {}        # tool -> arguments stored in the history only as their length
+CLAUSE_RULES = []        # (clause, context) -> [(tool, args)] or None: deterministic automation phrases
+SOFT_REFUSALS = {}       # tool -> verbs the task planner refuses but this tool handles safely (e.g. "type")
+
+
+def app_mentioned(request, app):
+    app = str(app or "").lower()
+    aliases = [alias for alias, key in nt.APP_ALIASES.items() if key == app]
+    aliases += {"explorer": ["explorer", "file explorer"], "browser": ["browser", "edge", "chrome", "firefox"],
+                "calculator": ["calculator", "calc"]}.get(app, [])
+    return _mentions(request, app, *aliases)
+
+
 def intent_problems(step, request):
     """Why a model-planned step does something the request didn't ask for (empty if it doesn't)."""
     problems = []
@@ -721,11 +808,9 @@ def intent_problems(step, request):
         site = str(args.get("site", ""))
         asked = _mentions(request, site, nt.WEBSITES.get(site, ("",))[0])
     elif step.tool in ("open_app", "switch_app"):
-        app = str(args.get("app", "")).lower()
-        aliases = [alias for alias, key in nt.APP_ALIASES.items() if key == app]
-        aliases += {"explorer": ["explorer", "file explorer"], "browser": ["browser", "edge", "chrome", "firefox"]}.get(
-            app, [])
-        asked = _mentions(request, app, *aliases)
+        asked = app_mentioned(request, args.get("app"))
+    elif step.tool in APP_TOOLS and "app" in args:
+        asked = asked and app_mentioned(request, args.get("app"))
     if not asked:
         problems.append(f"Step {step.id} ({step.tool}): the request didn't ask for this.")
     return problems
@@ -734,8 +819,9 @@ def intent_problems(step, request):
 def trim_plan(plan, request):
     """Leave out model-planned steps the request didn't ask for (and the steps that need them),
     and turn off "overwrite" unless the request asked to replace files. Returns notes for the user.
-    Nova's own rules planner only produces what was asked, so its plans are left alone."""
-    if plan.source == "rules":
+    Nova's own rules planner only produces what was asked, so its plans are left alone, as are resumed plans
+    (Step 32: steps of an earlier plan the user approved, checked against what was done since)."""
+    if plan.source in ("rules", "resume"):
         return []
     notes, removed = [], set()
     for step in plan.steps:
@@ -753,6 +839,11 @@ def trim_plan(plan, request):
                 not OVERWRITE_INTENT.search(request or ""):
             step.args["overwrite"] = False
             notes.append("Nova won't replace existing files: the request didn't ask for that.")
+        for name, pattern, note in ARG_GUARDS.get(step.tool, ()):
+            if isinstance(step.args, dict) and step.args.get(name) in (True, "true", "yes") and \
+                    not pattern.search(request or ""):
+                step.args[name] = False
+                notes.append(note)
     plan.steps = [s for s in plan.steps if s.id not in removed]
     return notes
 
@@ -913,24 +1004,31 @@ class Planner:
         return getattr(message, "content", "") or "", getattr(message, "tool_calls", None) or []
 
     # ---- planning ----
-    def plan(self, request, tools, max_steps, cancel=None, observations=None):
+    def plan(self, request, tools, max_steps, cancel=None, observations=None, context=None):
         rules = self._rules(request, tools)
         if rules is not None and observations is None:
             return rules
         if self.native:
             try:
-                return self._native(request, tools, cancel, observations)
+                return self._native(request, tools, cancel, observations, context)
             except PlanningError as exc:
                 log.info("Native tool calling didn't give a plan (%s); using JSON", exc)
-        return self._json(request, tools, max_steps, cancel, observations)
+        return self._json(request, tools, max_steps, cancel, observations, context)
 
     def _rules(self, request, tools):
-        """Nova's deterministic planner (Steps 20/25). Refusals there are final: the model is never asked."""
+        """Nova's deterministic planners (Step 30's automation rules, then Steps 20/25). Refusals there are
+        final: the model is never asked. The one exception is a verb the task planner refuses (“type”) that an
+        offered Step 30 tool handles safely, when nothing else in the request is refused."""
+        names = {t.name for t in tools}
+        steps = automation_plan(request, names)
+        if steps:
+            return AgentPlan(request, steps, "rules")
         steps, problems = nt.plan_with_rules(request)
         forbidden = [p for p in problems if p.startswith(nt.FORBIDDEN_PREFIX)]
         if forbidden:
+            if soft_refusal(request, names):
+                return None
             raise PlanningError(forbidden[0][len(nt.FORBIDDEN_PREFIX):])
-        names = {t.name for t in tools}
         if problems or not steps or any(s.action not in names for s in steps):
             return None
         return AgentPlan(request, [AgentStep(f"s{i}", s.action, dict(s.params), depends_on=[f"s{i - 1}"] if i > 1
@@ -942,9 +1040,9 @@ class Planner:
         return "\n".join(f"- {t.signature()}: {t.title} [{tags[t.safety]}]" + (f" -> {t.outputs}" if t.outputs else "")
                          for t in tools)
 
-    def _json(self, request, tools, max_steps, cancel, observations):
+    def _json(self, request, tools, max_steps, cancel, observations, context=None):
         system = PLANNER_RULES.format(tools=self._tool_lines(tools), max_steps=max_steps)
-        user = request if observations is None else observations
+        user = with_context(request if observations is None else observations, context)
         messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
         for attempt in range(2):                       # one repair round for malformed output
             content, _calls = self._message(self._call(
@@ -960,8 +1058,8 @@ class Planner:
                                                          "in the shape described."}]
         raise PlanningError("The model didn't return a valid plan.")
 
-    def _native(self, request, tools, cancel, observations):
-        user = request if observations is None else observations
+    def _native(self, request, tools, cancel, observations, context=None):
+        user = with_context(request if observations is None else observations, context)
         content, calls = self._message(self._call(
             cancel, messages=[{"role": "system", "content": NATIVE_RULES}, {"role": "user", "content": user}],
             tools=[t.spec() for t in tools], options={"temperature": 0, "num_ctx": self.num_ctx}))
@@ -980,6 +1078,80 @@ class Planner:
         if not steps and not content.strip():
             raise PlanningError("The model returned neither tool calls nor an answer.")
         return AgentPlan(request, steps, "native")
+
+
+def split_clauses(request):
+    """The request's clauses, split like the task planner splits them (quoted text is never split)."""
+    quoted = []
+
+    def hide(match):
+        quoted.append(match.group(0))
+        return f"\x00{len(quoted) - 1}\x00"
+
+    hidden = re.sub(r"\"[^\"\n]*\"|“[^”\n]*”", hide, str(request or "").strip())
+    parts = [p for part in nt._SPLIT.split(hidden) if part and part.strip() for p in _MORE_SPLIT.split(part)]
+    return [re.sub(r"\x00(\d+)\x00", lambda m: quoted[int(m.group(1))], part).strip()
+            for part in parts if part and part.strip()]
+
+
+# Verbs of the automation tools that the task planner's splitter doesn't know.
+_MORE_SPLIT = re.compile(r",?\s+and\s+(?=(?:click|press|close|quit|exit|enter|go\s+back|read|list|organi[sz]e|tidy|"
+                         r"sort|visit|browse|navigate)\b)", re.I)
+
+
+_POLITE = re.compile(r"^(?:please\s+|nova[,:]?\s+|also\s+|then\s+|and\s+)+", re.I)
+
+
+def automation_plan(request, names):
+    """A deterministic plan for requests with Step 30 automation phrases (“type "hi" in notepad”), mixed
+    with ordinary task phrases (“open notepad”), or None. Every clause must be understood, at least one
+    must be an automation phrase, and every tool must be offered; otherwise the other planners decide."""
+    if not CLAUSE_RULES:
+        return None
+    context, found, ours = {}, [], False
+    for clause in split_clauses(request):
+        text = _POLITE.sub("", clause).strip().rstrip(".!")
+        if _hard_refusal(text, names):
+            return None                                        # the task planner refuses it, and that stands
+        steps = None
+        try:
+            for rule in CLAUSE_RULES:
+                steps = rule(text, context)
+                if steps is not None:
+                    ours = True
+                    break
+            if steps is None:
+                steps = nt._parse_clause(clause, context)      # refusals there stand (ForbiddenRequest)
+        except nt.PlanError:
+            return None
+        found.extend(steps)
+    if not ours or not found or len(found) > nt.MAX_STEPS or any(tool not in names for tool, _args in found):
+        return None
+    return [AgentStep(f"s{i}", tool, dict(args), depends_on=[f"s{i - 1}"] if i > 1 else [])
+            for i, (tool, args) in enumerate(found, start=1)]
+
+
+def _hard_refusal(clause, names):
+    """Whether the task planner refuses this clause for a reason no offered tool makes safe (commands,
+    passwords, the registry, deleting folders…). A leading verb an offered tool handles (“type”) is fine."""
+    verbs = [SOFT_REFUSALS[n] for n in names if n in SOFT_REFUSALS]
+    text = clause.lower()
+    if verbs:
+        text = re.sub(rf"^(?:{'|'.join(verbs)})\b", "open", text, count=1)
+    return bool(nt._FORBIDDEN.search(text))
+
+
+def soft_refusal(request, names):
+    """True if the task planner refused the request only for verbs an offered tool handles safely
+    (e.g. “type … in notepad” with type_text offered). Anything else it refuses stays refused."""
+    if not any(n in SOFT_REFUSALS for n in names):
+        return False
+    return not any(_hard_refusal(_POLITE.sub("", c).strip().rstrip(".!"), names) for c in split_clauses(request))
+
+
+def with_context(text, context):
+    """The planner's user message with recalled memory (Step 32) placed before it, as reference data."""
+    return f"{context}\n\nRequest: {text}" if context else text
 
 
 _LOOSE_REF = re.compile(r"^\s*(?:\{\{\s*)?\$?(s\d{1,2}\.[a-z_]+(?:\[\d{1,3}\])?)(?:\s*\}\})?\s*$")
@@ -1077,7 +1249,8 @@ class AgentEngine:
     """Runs one request at a time: plan → approve → execute/verify/retry/replan → report."""
 
     def __init__(self, registry, planner, env, connect, limits=None, on_event=None, approve_plan=None,
-                 approve_step=None, approve_folders=None, pick=None, lock=None, answer=True, sleep=time.sleep):
+                 approve_step=None, approve_folders=None, pick=None, lock=None, answer=True, sleep=time.sleep,
+                 memory=None, origin="agent", policy=None):
         self.registry, self.planner, self.env, self.connect = registry, planner, env, connect
         self.limits = dict(DEFAULT_LIMITS, **(limits or {}))
         self.on_event = on_event or (lambda kind, data: None)
@@ -1088,6 +1261,12 @@ class AgentEngine:
         self.lock = lock or threading.Lock()
         self.answer = answer
         self.sleep = sleep
+        self.memory = memory               # Step 32: nova_recall.AgentMemory (recall before planning, record after)
+        self._memory_block = ""
+        import nova_policy                 # Step 34: one permission model for every origin
+        self.policy = policy or nova_policy.GATE
+        self.origin = origin
+        self._plan_approved_at = None
 
     def _event(self, kind, data=None):
         try:
@@ -1098,6 +1277,12 @@ class AgentEngine:
     # ---- the main loop ----
     def run(self, request, cancel=None, session_id=None):
         cancel = cancel or threading.Event()
+        import nova_policy
+        try:                                          # Step 34: nothing new starts while tasks are paused
+            self.policy.check_start(self.origin)
+        except nova_policy.Denied as exc:
+            nova_policy.log_decision(self.connect, None, None, None, request, "paused", self.origin, str(exc))
+            return Report(request, "rejected", problems=[str(exc)])
         if not self.lock.acquire(blocking=False):
             return Report(request, "rejected", problems=["Another task is already running. Try again when it's done."])
         try:
@@ -1108,12 +1293,27 @@ class AgentEngine:
     def _run(self, request, cancel, session_id):
         started = time.monotonic()
         self.env.request = request
-        tools = self.registry.permitted(self.env)
+        self.env.run_id = None
+        tools = self._offered(request)
         self._event("planning", request)
+        resume, self._memory_block = None, ""
+        if self.memory is not None:                   # Step 32: what Nova remembers, before planning
+            try:
+                resume = self.memory.resume(request, self.registry, self.env)
+                self._memory_block = resume.brief if resume else self.memory.context(request)
+            except Exception as exc:                  # memory must never stop a task from being planned
+                log.warning("Recalling memory failed: %s", exc)
+        if resume is not None and resume.state is None:
+            return Report(request, "rejected", problems=list(resume.notes))
+        if resume is not None and resume.plan is None:
+            report = Report(request, "succeeded", answer=resume_answer(resume))
+            self._event("done", report)
+            return report
         try:
-            plan = self.planner.plan(request, tools, self.limits["max_steps"], cancel)
+            plan = resume.plan if resume is not None else self.planner.plan(
+                request, tools, self.limits["max_steps"], cancel, context=self._memory_block)
             problems = validate_plan(plan, self.registry, self.env, self.limits)
-            if problems and plan.source != "rules":
+            if problems and plan.source not in ("rules", "resume"):
                 log.info("Agent plan rejected (%d problem(s)); asking for a corrected plan", len(problems))
                 named = {s.tool for s in plan.steps if self.registry.get(s.tool)}
                 hints = "\n".join(f"- {self.registry.get(name).signature()}" for name in sorted(named))
@@ -1137,7 +1337,7 @@ class AgentEngine:
             return Report(request, "rejected", problems=["The plan didn't pass Nova's checks, so nothing was run:"]
                           + problems[:6])
         report = Report(request, "succeeded", steps=plan.steps)
-        report.problems += list(dict.fromkeys(trimmed))
+        report.problems += list(dict.fromkeys(list(plan.notes) + trimmed))
         plan.notes = list(report.problems)
         if plan.unsupported:
             report.problems += [f"Not possible with Nova's tools: {item}" for item in plan.unsupported]
@@ -1145,11 +1345,19 @@ class AgentEngine:
             self._describe(step)
         self._event("plan", plan)
         report.run_id = self._record_start(plan, session_id)
+        self.env.run_id = report.run_id
+        self._plan_approved_at = None
         if any(s.safety != READ_ONLY for s in plan.steps):
-            if not self.approve_plan(plan):
+            import nova_policy
+            approved = self.approve_plan(plan)
+            nova_policy.log_decision(self.connect, report.run_id, None, None, f"plan of {len(plan.steps)} step(s): "
+                                     + "; ".join(s.description or s.tool for s in plan.steps)[:250],
+                                     "approved" if approved else "declined", self.origin)
+            if not approved:
                 for step in plan.steps:
                     step.status, step.error = "cancelled", "You didn't approve the plan."
                 return self._finish(report, "cancelled", cancel)
+            self._plan_approved_at = time.monotonic()       # the approval covers changes only for a while
         self._approved_ids = {s.id for s in plan.steps}
         self._source = plan.source
         replans, executed, index = 0, 0, 0
@@ -1197,6 +1405,23 @@ class AgentEngine:
                         continue
         return self._finish(report, overall_status(steps), cancel)
 
+    def preview(self, request, cancel=None):
+        """Plan a request without running or recording anything: (plan, problems). Step 33 checks a scheduled
+        task's plan this way, so the user approves exactly which tools and folders it may use."""
+        self.env.request = request
+        plan = self.planner.plan(request, self._offered(request), self.limits["max_steps"], cancel)
+        problems = validate_plan(plan, self.registry, self.env, self.limits)
+        if not problems:
+            plan.notes = trim_plan(plan, request) + repair_paths(plan, request)
+            for step in plan.steps:
+                self._describe(step)
+        return plan, problems
+
+    def _offered(self, request):
+        """The permitted tools that are relevant to this request (all of them, apart from automation tools
+        whose kind of action the request doesn't mention)."""
+        return [t for t in self.registry.permitted(self.env) if t.offer(request)]
+
     def _describe(self, step):
         tool = self.registry.get(step.tool)
         try:
@@ -1207,7 +1432,7 @@ class AgentEngine:
         if preview is not None:
             step.description, step.safety = preview.description, preview.safety
         else:
-            step.description = step.purpose or f"{tool.title} ({', '.join(f'{k}={v}' for k, v in step.args.items())})"
+            step.description = step.purpose or f"{tool.title} ({', '.join(f'{k}={v}' for k, v in _stored_args(step).items())})"
 
     # ---- one step ----
     def _execute(self, report, step, by_id, cancel):
@@ -1216,10 +1441,15 @@ class AgentEngine:
         try:
             args = {}
             from_refs = set()
+            untrusted_from = None                  # Step 34: an argument taken from outside content
+            import nova_policy
             for name, value in step.args.items():
                 args[name] = resolve(value, by_id)
                 if args[name] != value:
                     from_refs.add(name)
+                    source = by_id[REF.match(value).group("step")].tool
+                    if source in nova_policy.UNTRUSTED_OUTPUT:
+                        untrusted_from = untrusted_from or source
             args = check_args(tool.input_schema, args)                 # validated again with real values
             if not tool.available(self.env)[0]:
                 raise ToolError(f"{tool.title} isn't available right now ({tool.available(self.env)[1]}).")
@@ -1237,30 +1467,64 @@ class AgentEngine:
             # results are trusted; paths the model wrote need a confirmation.
             path_args = [n for n in args if n in nt.PICK_PARAMS]
             said = os.path.normcase(self.env.request)
-            trusted = self._source == "rules" or all(
+            trusted = self._source in ("rules", "resume") or all(
                 n in from_refs or str(args[n]).lower() in nt.KNOWN_FOLDERS
                 or os.path.normcase(str(args[n]).rstrip("\\/")) in said for n in path_args)
             prepared = tool.prepare(args, self.env, trusted=trusted)
         except (ToolError, nt.PlanError) as exc:
             self._set(report, step, "failed", error=str(exc))
             return "failed"
+        # Step 34: the permission model, whatever the origin. Unknown tools are denied; external and
+        # consequential calls always ask; changes driven by outside content ask; a stale plan approval asks.
+        decision = self.policy.decide(step.tool, self.origin, untrusted_from, prepared.confirm)
+        run_id = getattr(self, "_run_id", None)
+        if not decision.allowed:
+            nova_policy.log_decision(self.connect, run_id, step.id, step.tool, prepared.description, "denied",
+                                     self.origin, decision.reason)
+            self._set(report, step, "failed", error=f"Not allowed: {decision.reason}")
+            return "failed"
+        if decision.confirm:
+            prepared.confirm = decision.confirm
+            prepared.safety = max(prepared.safety, nova_policy.safety_for(self.policy.capability(step.tool)),
+                                  key=lambda s: SAFETY_ORDER[s])
+        if prepared.safety != READ_ONLY and not prepared.confirm and self.policy.approval_expired(
+                self._plan_approved_at):
+            prepared.confirm = (f"you approved the plan more than {self.policy.approval_ttl // 60} minutes ago, so "
+                                "Nova checks with you again")
+            nova_policy.log_decision(self.connect, run_id, step.id, step.tool, prepared.description, "expired",
+                                     self.origin)
         step.description, step.safety = prepared.description, prepared.safety
         # Approvals, enforced here (not in the prompt): consequential steps and confirmations every time;
         # steps added by replanning need approval unless they only read; folders must be allowed.
         if prepared.unapproved:
-            if not self.approve_folders(step, prepared.unapproved):
+            allowed = self.approve_folders(step, prepared.unapproved)
+            nova_policy.log_decision(self.connect, run_id, step.id, step.tool, "use folder(s) "
+                                     + ", ".join(prepared.unapproved), "approved" if allowed else "declined",
+                                     self.origin)
+            if not allowed:
                 self._set(report, step, "declined", error="You didn't allow " + ", ".join(prepared.unapproved) + ".")
                 return "declined"
             self.env.approved.update(prepared.unapproved)
             prepared = tool.prepare(args, self.env, trusted=trusted)
+            if decision.confirm:
+                prepared.confirm = prepared.confirm or decision.confirm
+                prepared.safety = step.safety
             if prepared.unapproved:
                 self._set(report, step, "failed", error="The folder still isn't allowed.")
                 return "failed"
         needs = (prepared.safety == CONSEQUENTIAL or prepared.confirm
                  or (step.id not in self._approved_ids and prepared.safety != READ_ONLY))
-        if needs and not self.approve_step(step, prepared):
-            self._set(report, step, "declined", error="You chose not to run this step.")
-            return "declined"
+        if needs:
+            approved = self.approve_step(step, prepared)
+            nova_policy.log_decision(self.connect, run_id, step.id, step.tool, prepared.description,
+                                     "approved" if approved else "declined", self.origin,
+                                     prepared.confirm or "added after the plan was approved")
+            if not approved:
+                self._set(report, step, "declined", error="You chose not to run this step.")
+                return "declined"
+        elif prepared.safety != READ_ONLY:
+            nova_policy.log_decision(self.connect, run_id, step.id, step.tool, prepared.description, "allowed",
+                                     self.origin, "covered by the plan you approved")
         attempts = 1 + self.limits["max_retries"]
         for attempt in range(1, attempts + 1):
             if cancel.is_set():
@@ -1330,7 +1594,7 @@ class AgentEngine:
                   "safe alternative, return an empty steps list.")
         self._event("replanning", failed)
         try:
-            plan = self.planner.plan(self.env.request, self.registry.permitted(self.env), self.limits["max_steps"],
+            plan = self.planner.plan(self.env.request, self._offered(self.env.request), self.limits["max_steps"],
                                      cancel, observations=prompt)
         except (PlanningError, Cancelled) as exc:
             log.info("Replanning failed: %s", exc)
@@ -1371,6 +1635,11 @@ class AgentEngine:
         elif self.answer and not report.steps and status == "succeeded":
             report.answer = self._compose(report, cancel)
         self._record_finish(report)
+        if self.memory is not None:                   # Step 32: keep the verified outcome for next time
+            try:
+                self.memory.record(report, self.registry)
+            except Exception as exc:
+                log.warning("Recording the task in memory failed: %s", exc)
         self._event("done", report)
         log.info("Agent task %s finished: %s (%d steps)", report.run_id, status, len(report.steps))
         return report
@@ -1386,6 +1655,8 @@ class AgentEngine:
             lines.append(f"- {step.description or step.tool}: {step.status}"
                          + (f" ({step.error})" if step.error else "") + (f"\n  data: {data}" if data else ""))
         content = (f"Request: {report.request}\n\nVerified results:\n" + ("\n".join(lines) or "(no tools were needed)"))
+        if self._memory_block:                        # what was recalled, clearly marked as reference data
+            content = f"{self._memory_block}\n\n{content}"
         try:
             response = self.planner._call(cancel, messages=[{"role": "system", "content": ANSWER_RULES},
                                                             {"role": "user", "content": content}],
@@ -1404,6 +1675,13 @@ class AgentEngine:
             step.finished_at = _now()
         self._persist(report, step)
         self._event("step", step)
+        if status in ("succeeded", "failed", "timed_out") and step.safety != READ_ONLY and step.attempts:
+            tool = self.registry.get(step.tool)
+            args = _stored_args(step)
+            record_audit(self.connect, getattr(self, "_run_id", None), step.tool, step.description or step.tool,
+                         (tool.target(step.args) if tool else "") or "; ".join(
+                             f"{k}={v}" for k, v in args.items() if k in nt.PICK_PARAMS or k in ("app", "url")),
+                         status, step.evidence if status == "succeeded" else step.error)
 
     # ---- history (the Step 20 tables; contents are never stored) ----
     def _record_start(self, plan, session_id):
@@ -1416,6 +1694,10 @@ class AgentEngine:
                     "INSERT INTO task_runs (request, planner, plan_hash, status, session_id, created_at, started_at) "
                     "VALUES (?, 'agent', ?, 'running', ?, ?, ?)",
                     (plan.request, _hash(plan), session_id, _now(), _now())).lastrowid
+                try:                                  # Step 34: where the request came from (typed, voice, schedule)
+                    con.execute("UPDATE task_runs SET origin = ? WHERE id = ?", (self.origin, run_id))
+                except sqlite3.OperationalError:
+                    pass                              # an older history table without the column
             for position, step in enumerate(plan.steps):
                 step.position = position
             self._run_id = run_id
@@ -1478,6 +1760,19 @@ class AgentEngine:
             con.close()
 
 
+def resume_answer(resume):
+    """“Continue …” with nothing Nova can redo by itself: the verified state, no model involved."""
+    state = resume.state
+    lines = [f"**{state.thread.title}**: here's where it stands, checked against what Nova actually did."]
+    for title, items in (("Decided", state.decisions[-5:]), ("Done", state.done[-5:]), ("Blockers", state.blockers),
+                         ("Still to do", state.open_next)):
+        if items:
+            lines.append(f"{title}:\n" + "\n".join(f"- {e.content}" for e in items))
+    lines += [f"- {note}" for note in resume.notes[1:] if not note.startswith(("Open blocker", "Still to do"))]
+    lines.append("Nothing here is something Nova can redo by itself, so nothing was run. Tell me the next step.")
+    return "\n\n".join(lines)
+
+
 def overall_status(steps):
     """succeeded only if every step that ran succeeded, apart from failures a later
     “if it failed” step handled successfully, and at least one step did something."""
@@ -1499,7 +1794,9 @@ def overall_status(steps):
 def _stored_args(step):
     action = nt.REGISTRY.get(step.tool)
     if action is None:
-        return step.args
+        private = PRIVATE_ARGS.get(step.tool, ())
+        return {k: (f"<{len(str(v))} characters>" if k in private and isinstance(v, str) and not v.startswith("$")
+                    else v) for k, v in step.args.items()}
     return nt.history_params(nt.Step(step.tool, step.args))
 
 

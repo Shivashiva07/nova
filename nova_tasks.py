@@ -942,6 +942,8 @@ def initialize_schema(con):
     for column, kind in AGENT_STEP_COLUMNS.items():
         if column not in present:
             con.execute(f"ALTER TABLE task_steps ADD COLUMN {column} {kind}")
+    if "origin" not in {row[1] for row in con.execute("PRAGMA table_info(task_runs)")}:
+        con.execute("ALTER TABLE task_runs ADD COLUMN origin TEXT")   # Step 34: typed, voice, agent, task, schedule
     con.commit()
     with con:
         con.execute("UPDATE task_steps SET status = 'interrupted', finished_at = ? "
@@ -1057,6 +1059,11 @@ class TaskRunner:
 
     def run(self, run_id, plan, cancel, confirm, timeouts=None):
         """Execute a plan already stored as run_id. Returns (status, summary)."""
+        import nova_policy
+        try:                                      # Step 34: nothing new starts while tasks are paused
+            nova_policy.GATE.check_start("task")
+        except nova_policy.Denied as exc:
+            raise AlreadyRunning(str(exc)) from None
         if not self._lock.acquire(blocking=False):
             raise AlreadyRunning("Another task is already running.")
         con = self._connect()
@@ -1086,10 +1093,23 @@ class TaskRunner:
                     status = "cancelled"
                     self._set(con, run_id, position, step, "cancelled", error="Not run: the task was cancelled.")
                     continue
-                if step.sensitive and not confirm(step):
-                    status = "cancelled"
-                    self._set(con, run_id, position, step, "declined", error="You chose not to run this step.")
+                import nova_policy                 # Step 34: the same permission model as the agent
+                decision = nova_policy.GATE.decide(step.action, "task", already_confirming=step.sensitive)
+                if not decision.allowed:
+                    status = "failed"
+                    nova_policy.log_decision(self._connect, run_id, str(position + 1), step.action, step.description,
+                                             "denied", "task", decision.reason)
+                    self._set(con, run_id, position, step, "failed", error=f"Not allowed: {decision.reason}")
                     continue
+                step.sensitive = decision.confirm
+                if step.sensitive:
+                    approved = confirm(step)
+                    nova_policy.log_decision(self._connect, run_id, str(position + 1), step.action, step.description,
+                                             "approved" if approved else "declined", "task", step.sensitive)
+                    if not approved:
+                        status = "cancelled"
+                        self._set(con, run_id, position, step, "declined", error="You chose not to run this step.")
+                        continue
                 status = self._execute(con, run_id, position, step, cancel, (timeouts or {}).get(step.action),
                                        approved=frozenset(plan.picked))
             summary = summarize(plan, status)
